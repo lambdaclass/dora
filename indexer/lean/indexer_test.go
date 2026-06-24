@@ -222,6 +222,128 @@ func TestIndexerBackfillAndEvents(t *testing.T) {
 	}
 }
 
+// attBody builds a block body with a single attestation: validators vote for
+// headRoot at attSlot.
+func attBody(attSlot leanapi.Slot, headRoot leanapi.Root, validators ...int) leanapi.BlockBody {
+	return leanapi.BlockBody{Attestations: []leanapi.AggregatedAttestation{{
+		AggregationBits: bitlistWith(validators...),
+		Data: leanapi.AttestationData{
+			Slot: attSlot,
+			Head: leanapi.Checkpoint{Root: headRoot, Slot: attSlot},
+		},
+	}}}
+}
+
+// TestCacheDrivenIngestion exercises the rewired two-tier flow end to end:
+// genesis seed -> linear chain via block events -> competing sibling that wins
+// votes -> reorg + status flips -> finalize -> flush + prune.
+func TestCacheDrivenIngestion(t *testing.T) {
+	initTestDB(t)
+
+	genesisRoot := rootOf(0x00) // zero root; seed anchors here at slot 0
+	// Use small, distinct roots so lexicographic tiebreaks are predictable.
+	rA := rootOf(0x10) // slot 1
+	rB := rootOf(0x20) // slot 2 (left branch)
+	rC := rootOf(0x30) // slot 2 (right branch, the eventual winner)
+	rD := rootOf(0x40) // slot 3 on right branch
+
+	blkA := &leanapi.Block{Slot: 1, ProposerIndex: 1, ParentRoot: genesisRoot, StateRoot: rootOf(0xa0)}
+	blkB := &leanapi.Block{Slot: 2, ProposerIndex: 2, ParentRoot: rA, StateRoot: rootOf(0xb0),
+		Body: attBody(2, rB, 0)}
+	blkC := &leanapi.Block{Slot: 2, ProposerIndex: 3, ParentRoot: rA, StateRoot: rootOf(0xc0),
+		Body: attBody(2, rC, 1)}
+	blkD := &leanapi.Block{Slot: 3, ProposerIndex: 4, ParentRoot: rC, StateRoot: rootOf(0xd0),
+		Body: attBody(3, rC, 0, 1, 2)}
+
+	mc := &mockClient{
+		genesis: &leanapi.Genesis{GenesisTime: 1000, ValidatorCount: 8},
+		spec:    &leanapi.Spec{MillisecondsPerSlot: 4000, IntervalsPerSlot: 5, MillisecondsPerInterval: 800},
+		blocks: map[string]*leanapi.Block{
+			rA.String(): blkA, rB.String(): blkB, rC.String(): blkC, rD.String(): blkD,
+		},
+		forkChoice: &leanapi.ForkChoice{Head: rA, Finalized: leanapi.Checkpoint{Root: genesisRoot, Slot: 0}},
+		justified:  &leanapi.JustifiedCheckpoint{Root: genesisRoot, Slot: 0},
+	}
+
+	ctx := context.Background()
+	idx := NewIndexer(ctx, logrus.New().WithField("test", true), mc)
+
+	// Seed: finalized anchor at genesis (slot 0). The seed caches no block (zero
+	// root), so create the genesis cache node explicitly as the anchor.
+	idx.spec = leanapi.NewChainSpec(mc.genesis, mc.spec)
+	gen, _ := idx.blockCache.createOrGetBlock(genesisRoot, 0)
+	gen.SetBlock(&leanapi.Block{Slot: 0, ParentRoot: leanapi.Root{}, StateRoot: rootOf(0x99)})
+	gen.forkId = idx.forkCache.finalizedForkId
+	gen.forkChecked = true
+	idx.blockCache.addBlockToParentMap(gen)
+
+	// Ingest the linear chain A -> B via block events.
+	idx.onBlockEvent(&leanapi.BlockEventData{Slot: 1, Root: rA})
+	idx.onBlockEvent(&leanapi.BlockEventData{Slot: 2, Root: rB})
+	idx.onHeadEvent(&leanapi.HeadEventData{Slot: 2, Root: rB, ParentRoot: rA})
+
+	// B is canonical (only branch with a vote).
+	if sb, _ := db.GetSlotByRoot(ctx, rB.Bytes()); sb == nil || sb.Status != dbtypes.Canonical {
+		t.Fatalf("expected B canonical, got %+v", sb)
+	}
+
+	// Competing sibling C, then D on C with 3 votes -> right branch wins.
+	idx.onBlockEvent(&leanapi.BlockEventData{Slot: 2, Root: rC})
+	idx.onBlockEvent(&leanapi.BlockEventData{Slot: 3, Root: rD})
+	idx.onHeadEvent(&leanapi.HeadEventData{Slot: 3, Root: rD, ParentRoot: rC})
+
+	// After the head moves to D's branch: D and C canonical, B orphaned.
+	sd, _ := db.GetSlotByRoot(ctx, rD.Bytes())
+	if sd == nil || sd.Status != dbtypes.Canonical {
+		t.Fatalf("expected D canonical, got %+v", sd)
+	}
+	sc, _ := db.GetSlotByRoot(ctx, rC.Bytes())
+	if sc == nil || sc.Status != dbtypes.Canonical {
+		t.Fatalf("expected C canonical, got %+v", sc)
+	}
+	sb, _ := db.GetSlotByRoot(ctx, rB.Bytes())
+	if sb == nil || sb.Status != dbtypes.Orphaned {
+		t.Fatalf("expected B orphaned after reorg, got %+v", sb)
+	}
+
+	// Finalize at slot 2 (root C): flush slots <= 2 to DB, prune from cache.
+	idx.onFinalizedEvent(&leanapi.FinalizedCheckpointEventData{Slot: 2, Root: rC})
+
+	// Cache pruned: no blocks at slot <= 2 remain in the cache.
+	if got := idx.blockCache.getBlocksBySlot(2); len(got) != 0 {
+		t.Errorf("expected slot 2 pruned from cache, got %d blocks", len(got))
+	}
+	if got := idx.blockCache.getBlocksBySlot(1); len(got) != 0 {
+		t.Errorf("expected slot 1 pruned from cache, got %d blocks", len(got))
+	}
+	// D (slot 3 > finalized 2) stays in the cache.
+	if idx.blockCache.getBlockByRoot(rD) == nil {
+		t.Errorf("expected D (slot 3) to remain cached")
+	}
+
+	// DB: C finalized canonical, B finalized orphaned.
+	sc2, _ := db.GetSlotByRoot(ctx, rC.Bytes())
+	if sc2 == nil || !sc2.Finalized || sc2.Status != dbtypes.Canonical {
+		t.Errorf("expected C finalized+canonical in DB, got %+v", sc2)
+	}
+	sb2, _ := db.GetSlotByRoot(ctx, rB.Bytes())
+	if sb2 == nil || sb2.Status != dbtypes.Orphaned {
+		t.Errorf("expected B orphaned in DB after finalize, got %+v", sb2)
+	}
+
+	// Finalized checkpoint recorded.
+	fcps, _ := db.GetCheckpoints(ctx, dbtypes.CheckpointFinalized, 10)
+	found := false
+	for _, cp := range fcps {
+		if cp.Slot == 2 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected finalized checkpoint at slot 2, got %+v", fcps)
+	}
+}
+
 func TestSetBitsDropsSentinel(t *testing.T) {
 	// 0,2,3 set with sentinel at bit 8.
 	got := setBits(bitlistWith(0, 2, 3))

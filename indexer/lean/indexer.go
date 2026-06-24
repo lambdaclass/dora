@@ -40,9 +40,9 @@ type Indexer struct {
 	running       bool
 
 	// In-memory reorg-aware caches (ported from Dora's beacon indexer). They
-	// hold a back-reference to this Indexer, exactly as Dora's caches do. The
-	// caches are not yet wired into the ingestion path; a later task connects
-	// them.
+	// hold a back-reference to this Indexer and drive ingestion: every block at
+	// or above the finalized slot lives here (the unfinalized tier); blocks
+	// below finalized are flushed to the DB (the finalized tier) and pruned.
 	blockCache *blockCache
 	forkCache  *forkCache
 
@@ -62,13 +62,19 @@ func (idx *Indexer) finalizedCheckpoint() (lean.Slot, lean.Root) {
 	return lean.Slot(idx.finalizedSlot), idx.finalizedRoot
 }
 
-// NewIndexer constructs a lean indexer over the given client.
+// NewIndexer constructs a lean indexer over the given client, wiring its
+// in-memory block and fork caches.
 func NewIndexer(ctx context.Context, logger logrus.FieldLogger, client lean.ConsensusRPCClient) *Indexer {
-	return &Indexer{
+	idx := &Indexer{
 		ctx:    ctx,
 		logger: logger,
 		client: client,
 	}
+	idx.blockCache = newBlockCache(idx)
+	idx.forkCache = newForkCache(idx)
+	idx.forkCache.lastForkId = 1
+	idx.forkCache.finalizedForkId = 1
+	return idx
 }
 
 // Start initializes the chain spec, runs an initial backfill, then enters the
@@ -84,6 +90,10 @@ func (idx *Indexer) Start() error {
 	idx.running = true
 	idx.mu.Unlock()
 
+	// Seed the finalized anchor (and the genesis block) so canonical selection
+	// has a real anchor and fork detection a finalized fork id.
+	idx.seedFinalized()
+
 	// Initial backfill from genesis (or last known head) to the current head.
 	if err := idx.backfillToHead(); err != nil {
 		idx.logger.WithError(err).Warn("initial backfill failed; continuing with live stream")
@@ -91,6 +101,45 @@ func (idx *Indexer) Start() error {
 
 	idx.streamLoop()
 	return idx.ctx.Err()
+}
+
+// seedFinalized fetches the node's finalized checkpoint (preferring fork choice,
+// falling back to the justified checkpoint) and seeds idx.finalizedSlot/Root and
+// the fork cache's finalized anchor. It also fetches and caches the finalized
+// block itself so the canonical walk has a concrete anchor block.
+func (idx *Indexer) seedFinalized() {
+	var finalizedSlot lean.Slot
+	var finalizedRoot lean.Root
+
+	if fc, err := idx.client.GetForkChoice(idx.ctx); err == nil && !fc.Finalized.Root.IsZero() {
+		finalizedSlot = fc.Finalized.Slot
+		finalizedRoot = fc.Finalized.Root
+	} else if cp, err := idx.client.GetJustifiedCheckpoint(idx.ctx); err == nil {
+		// No finalized checkpoint yet (fresh chain): anchor on justified.
+		finalizedSlot = cp.Slot
+		finalizedRoot = cp.Root
+	}
+
+	idx.mu.Lock()
+	idx.finalizedSlot = uint64(finalizedSlot)
+	idx.finalizedRoot = finalizedRoot
+	idx.mu.Unlock()
+
+	// Cache the anchor block so computeCanonicalChain can descend from it.
+	if !finalizedRoot.IsZero() {
+		if anchor, err := idx.client.GetBlockByID(idx.ctx, finalizedRoot.String()); err == nil && anchor != nil {
+			block, _ := idx.blockCache.createOrGetBlock(finalizedRoot, anchor.Slot)
+			block.SetBlock(anchor)
+			block.forkId = idx.forkCache.finalizedForkId
+			block.forkChecked = true
+			idx.blockCache.addBlockToParentMap(block)
+		}
+	}
+
+	idx.logger.WithFields(logrus.Fields{
+		"finalized_slot": uint64(finalizedSlot),
+		"finalized_root": finalizedRoot.String(),
+	}).Info("seeded finalized anchor")
 }
 
 func (idx *Indexer) initSpec() error {
@@ -132,7 +181,11 @@ func (idx *Indexer) indexValidators() {
 }
 
 // backfillToHead fetches blocks in pages from the last indexed slot up to the
-// node's current head and persists them.
+// node's current head. It applies the two-tier model: blocks below the
+// finalized slot are written straight to the DB finalized tier and never enter
+// the cache; blocks at or above the finalized slot are loaded into the
+// blockCache and fed through fork detection. After seeding the cache it runs
+// canonical selection once and persists the canonical/orphaned diff.
 func (idx *Indexer) backfillToHead() error {
 	sync, err := idx.client.GetSyncState(idx.ctx)
 	if err != nil {
@@ -145,7 +198,11 @@ func (idx *Indexer) backfillToHead() error {
 		start = head + 1
 	}
 
+	_, finalizedRootSnapshot := idx.finalizedCheckpoint()
+	finalizedSlot, _ := idx.finalizedCheckpoint()
+
 	const pageSize = uint64(256)
+	cachedAny := false
 	for from := start; from <= target; from += pageSize {
 		select {
 		case <-idx.ctx.Done():
@@ -156,19 +213,49 @@ func (idx *Indexer) backfillToHead() error {
 		if err != nil {
 			return fmt.Errorf("get blocks [%d,+%d): %w", from, pageSize, err)
 		}
-		// The range endpoint returns blocks without their roots. We chain roots
-		// from each block's child parent_root (blocks come back slot-ordered),
-		// and for the last block resolve its root via the block-header lookup.
+		// The range endpoint returns blocks without their roots. We still derive
+		// a root per block from the parent-chain (the only available source),
+		// then route each block to the finalized tier (DB) or unfinalized tier
+		// (cache) by slot.
 		roots := idx.resolveBackfillRoots(blocks)
 		for i, b := range blocks {
-			if err := idx.persistBlock(b, roots[i], dbtypes.Canonical, 0); err != nil {
-				idx.logger.WithError(err).WithField("slot", b.Slot).Warn("failed to persist backfilled block")
+			if b.Slot < finalizedSlot {
+				// Finalized tier: write straight to the DB, never cache.
+				if err := idx.persistFinalizedTierBlock(b, roots[i], dbtypes.Canonical, true); err != nil {
+					idx.logger.WithError(err).WithField("slot", b.Slot).Warn("failed to persist finalized-tier block")
+				}
+				continue
 			}
+			// Unfinalized tier: load into the cache and run fork detection.
+			idx.ingestCacheBlock(b, roots[i], 0)
+			cachedAny = true
 		}
 		idx.logger.WithFields(logrus.Fields{"from": from, "count": len(blocks)}).Debug("backfilled block page")
 	}
+
+	_ = finalizedRootSnapshot
+	if cachedAny {
+		idx.computeAndPersistCanonical()
+	}
 	idx.updateFinality()
 	return nil
+}
+
+// ingestCacheBlock loads a block into the unfinalized-tier cache: it creates the
+// cache node, attaches the body, links it under its parent, and runs fork
+// detection. recvDelay is the ms after the slot start at which the block was
+// first seen (0 for backfill).
+func (idx *Indexer) ingestCacheBlock(b *lean.Block, root lean.Root, recvDelay int32) *Block {
+	block, _ := idx.blockCache.createOrGetBlock(root, b.Slot)
+	block.SetBlock(b)
+	if recvDelay > 0 {
+		block.SetSeen(time.Now(), recvDelay)
+	}
+	idx.blockCache.addBlockToParentMap(block)
+	if err := idx.forkCache.processBlock(block); err != nil {
+		idx.logger.WithError(err).WithField("slot", b.Slot).Debug("fork detection failed")
+	}
+	return block
 }
 
 // streamLoop subscribes to the SSE stream and reconnects (with a backfill of
@@ -230,7 +317,9 @@ func (idx *Indexer) handleEvent(ev lean.StreamEvent) {
 	}
 }
 
-// onBlockEvent fetches and persists a freshly imported block.
+// onBlockEvent ingests a freshly imported block into the unfinalized-tier
+// cache, runs fork detection + canonical selection, and persists the resulting
+// canonical/orphaned diff (plus votes, duty, and the unfinalized-block blob).
 func (idx *Indexer) onBlockEvent(d *lean.BlockEventData) {
 	block, err := idx.client.GetBlockByID(idx.ctx, d.Root.String())
 	if err != nil {
@@ -238,96 +327,133 @@ func (idx *Indexer) onBlockEvent(d *lean.BlockEventData) {
 		return
 	}
 	recvDelay := idx.recvDelayMs(uint64(block.Slot))
-	if err := idx.persistBlock(block, d.Root, dbtypes.Canonical, recvDelay); err != nil {
-		idx.logger.WithError(err).WithField("slot", block.Slot).Warn("failed to persist block")
+	cacheBlock := idx.ingestCacheBlock(block, d.Root, recvDelay)
+
+	// Cache the raw block blob for reorg replay (unfinalized tier).
+	if blob, err := json.Marshal(block); err == nil {
+		ub := &dbtypes.UnfinalizedBlock{
+			Root:      d.Root.Bytes(),
+			Slot:      uint64(block.Slot),
+			Status:    dbtypes.UnfinalizedBlockStatusProcessed,
+			BlockData: blob,
+		}
+		err := db.RunDBTransaction(func(tx *sqlx.Tx) error {
+			return db.InsertUnfinalizedBlock(idx.ctx, ub, tx)
+		})
+		if err != nil {
+			idx.logger.WithError(err).Debug("failed to cache unfinalized block blob")
+		}
 	}
+	_ = cacheBlock
+
+	idx.computeAndPersistCanonical()
 }
 
-// onHeadEvent updates the tracked head and refreshes finality + reorg status.
+// onHeadEvent recomputes the canonical head; if the head moved and an old head
+// is known, it computes the reorg (depth/forward/common ancestor), logs it, and
+// persists the canonical/orphaned status flips. Replaces the old fork-choice
+// ancestor walk (reconcileCanonical).
 func (idx *Indexer) onHeadEvent(d *lean.HeadEventData) {
 	idx.mu.Lock()
+	oldHeadRoot := idx.headRoot
 	idx.headSlot = d.Slot
 	idx.headRoot = d.Root
 	idx.mu.Unlock()
 	idx.logger.WithFields(logrus.Fields{"slot": d.Slot, "root": d.Root.String()}).Debug("head updated")
-	idx.reconcileCanonical()
+
+	newHead, _, changed := idx.computeCanonicalChain()
+
+	if changed && !oldHeadRoot.IsZero() {
+		oldBlock := idx.blockCache.getBlockByRoot(oldHeadRoot)
+		newBlock := idx.blockCache.getBlockByRoot(newHead)
+		if oldBlock != nil && newBlock != nil && oldBlock != newBlock {
+			if reorg := idx.processReorg(oldBlock, newBlock); reorg != nil {
+				idx.logger.WithFields(logrus.Fields{
+					"depth":           reorg.Depth,
+					"forward":         reorg.ForwardDistance,
+					"old_head":        reorg.OldHead.String(),
+					"new_head":        reorg.NewHead.String(),
+					"common_ancestor": reorg.CommonAncestor.String(),
+				}).Info("reorg detected")
+			}
+		}
+	}
+
+	idx.persistCanonicalDiff()
+	idx.crossCheckHead(newHead)
 	idx.updateFinality()
 }
 
-// onFinalizedEvent records a finalized checkpoint and marks slots finalized.
+// onFinalizedEvent advances finalization: flush cache blocks at/below the
+// finalized slot to the DB finalized tier and prune them.
 func (idx *Indexer) onFinalizedEvent(d *lean.FinalizedCheckpointEventData) {
-	idx.mu.Lock()
-	idx.finalizedSlot = d.Slot
-	idx.mu.Unlock()
-	err := db.RunDBTransaction(func(tx *sqlx.Tx) error {
-		cp := &dbtypes.Checkpoint{Slot: d.Slot, Root: d.Root.Bytes(), Type: dbtypes.CheckpointFinalized}
-		if err := db.InsertCheckpoint(idx.ctx, cp, tx); err != nil {
-			return err
-		}
-		return db.DeleteUnfinalizedBlocksBelow(idx.ctx, d.Slot, tx)
-	})
-	if err != nil {
-		idx.logger.WithError(err).Warn("failed to record finalized checkpoint")
-		return
-	}
+	idx.finalizeBelow(lean.Slot(d.Slot), d.Root)
 	idx.markFinalized(d.Slot)
 	idx.logger.WithFields(logrus.Fields{"slot": d.Slot, "root": d.Root.String()}).Info("finalized checkpoint")
 }
 
-// reconcileCanonical walks the fork-choice tree and marks any slot rows not on
-// the canonical chain as orphaned. This is the reorg handler.
-func (idx *Indexer) reconcileCanonical() {
-	fc, err := idx.client.GetForkChoice(idx.ctx)
-	if err != nil {
-		idx.logger.WithError(err).Debug("fork choice fetch failed during reconcile")
+// computeAndPersistCanonical recomputes the canonical chain, cross-checks it
+// against the node, and persists the canonical/orphaned diff for cached blocks.
+func (idx *Indexer) computeAndPersistCanonical() {
+	head, _, _ := idx.computeCanonicalChain()
+	idx.persistCanonicalDiff()
+	idx.crossCheckHead(head)
+}
+
+// persistCanonicalDiff writes the current canonical/orphaned status for every
+// cached (unfinalized-tier) block to the slots table. Each cache block's slot
+// row reflects whether it lies on the canonical chain to the computed head.
+func (idx *Indexer) persistCanonicalDiff() {
+	head := idx.canonicalHead
+	canonical := idx.canonicalSet(head)
+
+	blocks := idx.blockCache.getAllBlocks()
+	if len(blocks) == 0 {
 		return
 	}
-	// Build the canonical ancestor set by walking from head to finalized.
-	byRoot := make(map[lean.Root]lean.ForkChoiceNode, len(fc.Nodes))
-	for _, n := range fc.Nodes {
-		byRoot[n.Root] = n
-	}
-	canonical := make(map[lean.Root]bool)
-	cur := fc.Head
-	for {
-		node, ok := byRoot[cur]
-		if !ok {
-			break
-		}
-		canonical[cur] = true
-		if node.ParentRoot.IsZero() || node.ParentRoot == cur {
-			break
-		}
-		cur = node.ParentRoot
-	}
-	// Any fork-choice node not in the canonical set is an orphan.
-	err = db.RunDBTransaction(func(tx *sqlx.Tx) error {
-		for _, n := range fc.Nodes {
-			status := dbtypes.Orphaned
-			if canonical[n.Root] {
-				status = dbtypes.Canonical
-			}
-			existing, gerr := db.GetSlotByRoot(idx.ctx, n.Root.Bytes())
-			if gerr != nil || existing == nil {
+
+	err := db.RunDBTransaction(func(tx *sqlx.Tx) error {
+		for _, block := range blocks {
+			body := block.GetBody()
+			if body == nil {
 				continue
 			}
-			if existing.Status != status {
-				existing.Status = status
-				if err := db.InsertSlot(idx.ctx, existing, tx); err != nil {
-					return err
-				}
+			status := dbtypes.Orphaned
+			if canonical[block.Root] {
+				status = dbtypes.Canonical
+			}
+			if err := idx.persistCacheBlock(tx, block, status, false); err != nil {
+				return err
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		idx.logger.WithError(err).Debug("canonical reconcile write failed")
+		idx.logger.WithError(err).Debug("canonical diff persist failed")
 	}
 }
 
-// persistBlock writes a block (and its attestations as votes, and its proposer
-// duty) into the DB inside a single transaction.
-func (idx *Indexer) persistBlock(b *lean.Block, root lean.Root, status dbtypes.SlotStatus, recvDelay int32) error {
+// crossCheckHead compares the locally computed head against the node's
+// authoritative fork-choice head and logs any divergence. The node is
+// authoritative; we only log (do not override) so display stays consistent
+// while divergence is observable.
+func (idx *Indexer) crossCheckHead(computed lean.Root) {
+	fc, err := idx.client.GetForkChoice(idx.ctx)
+	if err != nil || fc == nil {
+		return
+	}
+	if !fc.Head.IsZero() && fc.Head != computed {
+		idx.logger.WithFields(logrus.Fields{
+			"computed_head": computed.String(),
+			"node_head":     fc.Head.String(),
+		}).Warnf("computed head diverges from node fork-choice head")
+	}
+}
+
+// persistFinalizedTierBlock writes a finalized-tier (below-finalized) block
+// straight to the DB without caching it: the slot row (finalized), the proposer
+// duty, and the per-validator votes, in a single transaction.
+func (idx *Indexer) persistFinalizedTierBlock(b *lean.Block, root lean.Root, status dbtypes.SlotStatus, finalized bool) error {
 	slotRow := &dbtypes.Slot{
 		Slot:             uint64(b.Slot),
 		Root:             root.Bytes(),
@@ -336,7 +462,7 @@ func (idx *Indexer) persistBlock(b *lean.Block, root lean.Root, status dbtypes.S
 		Proposer:         b.ProposerIndex,
 		Status:           status,
 		AttestationCount: uint64(len(b.Body.Attestations)),
-		RecvDelay:        recvDelay,
+		Finalized:        finalized,
 	}
 	if blob, err := json.Marshal(b); err == nil {
 		slotRow.BlockSize = uint64(len(blob))
@@ -346,11 +472,10 @@ func (idx *Indexer) persistBlock(b *lean.Block, root lean.Root, status dbtypes.S
 		if err := db.InsertSlot(idx.ctx, slotRow, tx); err != nil {
 			return err
 		}
-		duty := &dbtypes.ValidatorDuty{Slot: uint64(b.Slot), Proposer: b.ProposerIndex, Fulfilled: true}
+		duty := &dbtypes.ValidatorDuty{Slot: uint64(b.Slot), Proposer: b.ProposerIndex, Fulfilled: status == dbtypes.Canonical}
 		if err := db.InsertValidatorDuty(idx.ctx, duty, tx); err != nil {
 			return err
 		}
-		// Persist each aggregated attestation as per-validator votes.
 		for _, att := range b.Body.Attestations {
 			for _, vi := range setBits(att.AggregationBits) {
 				vote := &dbtypes.Vote{
@@ -365,18 +490,6 @@ func (idx *Indexer) persistBlock(b *lean.Block, root lean.Root, status dbtypes.S
 				if err := db.InsertVote(idx.ctx, vote, tx); err != nil {
 					return err
 				}
-			}
-		}
-		// Cache the raw block near head for reorg replay.
-		if blob, err := json.Marshal(b); err == nil {
-			ub := &dbtypes.UnfinalizedBlock{
-				Root:      root.Bytes(),
-				Slot:      uint64(b.Slot),
-				Status:    dbtypes.UnfinalizedBlockStatusProcessed,
-				BlockData: blob,
-			}
-			if err := db.InsertUnfinalizedBlock(idx.ctx, ub, tx); err != nil {
-				return err
 			}
 		}
 		return nil
