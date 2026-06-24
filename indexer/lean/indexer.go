@@ -46,12 +46,14 @@ type Indexer struct {
 	blockCache *blockCache
 	forkCache  *forkCache
 
-	// Canonical head selection (LMD-GHOST) state. canonicalComputation is the
-	// latest-block marker used to short-circuit recomputation when the cache is
-	// unchanged (mirrors Dora's canonicalComputation).
-	canonicalHeadMutex   sync.Mutex
-	canonicalHead        lean.Root
-	canonicalComputation lean.Root
+	// Canonical head selection (LMD-GHOST) state. canonicalComputedVersion is
+	// the blockCache.version at the last computation, used to short-circuit
+	// recomputation when the cache is unchanged. canonicalComputed guards the
+	// zero value (version 0 is a valid initial version).
+	canonicalHeadMutex       sync.Mutex
+	canonicalHead            lean.Root
+	canonicalComputed        bool
+	canonicalComputedVersion uint64
 }
 
 // finalizedCheckpoint returns the currently tracked finalized slot and root.
@@ -72,8 +74,8 @@ func NewIndexer(ctx context.Context, logger logrus.FieldLogger, client lean.Cons
 	}
 	idx.blockCache = newBlockCache(idx)
 	idx.forkCache = newForkCache(idx)
-	idx.forkCache.lastForkId = 1
-	idx.forkCache.finalizedForkId = 1
+	idx.forkCache.lastForkId.Store(1)
+	idx.forkCache.finalizedForkId.Store(1)
 	return idx
 }
 
@@ -130,8 +132,8 @@ func (idx *Indexer) seedFinalized() {
 		if anchor, err := idx.client.GetBlockByID(idx.ctx, finalizedRoot.String()); err == nil && anchor != nil {
 			block, _ := idx.blockCache.createOrGetBlock(finalizedRoot, anchor.Slot)
 			block.SetBlock(anchor)
-			block.forkId = idx.forkCache.finalizedForkId
-			block.forkChecked = true
+			block.setForkId(idx.forkCache.getFinalizedForkId())
+			block.setForkChecked()
 			idx.blockCache.addBlockToParentMap(block)
 		}
 	}
@@ -217,13 +219,23 @@ func (idx *Indexer) backfillToHead() error {
 		// a root per block from the parent-chain (the only available source),
 		// then route each block to the finalized tier (DB) or unfinalized tier
 		// (cache) by slot.
-		roots := idx.resolveBackfillRoots(blocks)
+		roots, resolved := idx.resolveBackfillRoots(blocks)
 		for i, b := range blocks {
 			if b.Slot < finalizedSlot {
-				// Finalized tier: write straight to the DB, never cache.
+				// Finalized tier: write straight to the DB, never cache. An
+				// unresolved root here is a best-effort key; acceptable because
+				// it never enters the cache nor participates in parent linkage.
 				if err := idx.persistFinalizedTierBlock(b, roots[i], dbtypes.Canonical, true); err != nil {
 					idx.logger.WithError(err).WithField("slot", b.Slot).Warn("failed to persist finalized-tier block")
 				}
+				continue
+			}
+			if !resolved[i] {
+				// Unfinalized tier but root unresolved: do NOT cache it under a
+				// state-root key (it would break parent linkage and the SSE path
+				// would create a duplicate node for the real root). Skip; the SSE
+				// stream will deliver it with its authoritative root.
+				idx.logger.WithField("slot", b.Slot).Debug("skipping unresolved backfill block; SSE will supply it")
 				continue
 			}
 			// Unfinalized tier: load into the cache and run fork detection.
@@ -246,14 +258,31 @@ func (idx *Indexer) backfillToHead() error {
 // detection. recvDelay is the ms after the slot start at which the block was
 // first seen (0 for backfill).
 func (idx *Indexer) ingestCacheBlock(b *lean.Block, root lean.Root, recvDelay int32) *Block {
-	block, _ := idx.blockCache.createOrGetBlock(root, b.Slot)
+	block, created := idx.blockCache.createOrGetBlock(root, b.Slot)
+	hadBody := block.GetBody() != nil
 	block.SetBlock(b)
+	// If the body was newly attached on an existing node (createOrGetBlock did
+	// not bump the version because the node already existed), bump the cache
+	// version so canonical recomputation is not short-circuited away.
+	if !created && !hadBody {
+		idx.blockCache.markChanged()
+	}
 	if recvDelay > 0 {
 		block.SetSeen(time.Now(), recvDelay)
 	}
 	idx.blockCache.addBlockToParentMap(block)
 	if err := idx.forkCache.processBlock(block); err != nil {
 		idx.logger.WithError(err).WithField("slot", b.Slot).Debug("fork detection failed")
+	}
+
+	// N4: the unfinalized-tier cache only shrinks on finalization. ethlambda can
+	// stall finality for extended periods, growing the cache unbounded. We do
+	// not cap it here (dropping near-head blocks would corrupt fork choice), but
+	// we warn past a threshold so operators see the stall. A hard cap / spill to
+	// DB is left as a TODO for a dedicated pruning policy.
+	const cacheSizeWarnThreshold = 10000
+	if sz := idx.blockCache.size(); sz >= cacheSizeWarnThreshold && sz%cacheSizeWarnThreshold == 0 {
+		idx.logger.WithField("cache_blocks", sz).Warn("unfinalized block cache is large; finality may be stalled (TODO: bounded pruning policy)")
 	}
 	return block
 }

@@ -38,8 +38,8 @@ func (cache *forkCache) processBlock(block *Block) error {
 		parentSlot = 0
 		parentIsProcessed = false
 		parentIsFinalized = true
-	} else if parentBlock := cache.indexer.blockCache.getBlockByRoot(parentRoot); parentBlock != nil && parentBlock.forkChecked {
-		parentForkId = parentBlock.forkId
+	} else if parentBlock := cache.indexer.blockCache.getBlockByRoot(parentRoot); parentBlock != nil && parentBlock.isForkChecked() {
+		parentForkId = parentBlock.GetForkId()
 		parentSlot = parentBlock.Slot
 		parentIsProcessed = true
 		parentIsFinalized = parentBlock.Slot < finalizedSlot
@@ -52,7 +52,7 @@ func (cache *forkCache) processBlock(block *Block) error {
 		parentSlot = 0
 		parentIsProcessed = false
 		parentIsFinalized = true
-		cache.finalizedForkId = parentForkId
+		cache.finalizedForkId.Store(uint64(parentForkId))
 	}
 
 	// check if this block (c) introduces a new fork, it does so if:
@@ -86,8 +86,7 @@ func (cache *forkCache) processBlock(block *Block) error {
 			if cache.getForkByLeaf(block.Root) != nil {
 				cache.indexer.logger.Warnf("fork already exists for leaf %v [%v] (processing %v, scenario 1)", block.Slot, block.Root.String(), block.Slot)
 			} else {
-				cache.lastForkId++
-				fork := newFork(cache.lastForkId, parentSlot, parentRoot, block, parentForkId)
+				fork := newFork(cache.nextForkId(), parentSlot, parentRoot, block, parentForkId)
 				cache.addFork(fork)
 
 				currentForkId = fork.forkId
@@ -111,12 +110,11 @@ func (cache *forkCache) processBlock(block *Block) error {
 				if cache.getForkByLeaf(otherChildren[0].Root) != nil {
 					cache.indexer.logger.Warnf("fork already exists for leaf %v [%v] (processing %v, scenario 1)", otherChildren[0].Slot, otherChildren[0].Root.String(), block.Slot)
 				} else {
-					cache.lastForkId++
-					otherFork := newFork(cache.lastForkId, parentSlot, parentRoot, otherChildren[0], parentForkId)
+					otherFork := newFork(cache.nextForkId(), parentSlot, parentRoot, otherChildren[0], parentForkId)
 					cache.addFork(otherFork)
 
 					_, _, headBlock := cache.updateForkBlocks(otherChildren[0], otherFork.forkId, false)
-					otherFork.headBlock = headBlock
+					cache.setForkHead(otherFork, headBlock)
 					cache.parentIdCache.Add(otherFork.forkId, otherFork.parentFork)
 					newForks = append(newForks, otherFork)
 
@@ -132,20 +130,19 @@ func (cache *forkCache) processBlock(block *Block) error {
 
 	// avoid using forkid 0 for unfinalized blocks, add a new temporary forkid if needed
 	if currentForkId == 0 && parentIsFinalized {
-		cache.lastForkId++
-		fork := newFork(cache.lastForkId, parentSlot, parentRoot, block, parentForkId)
+		fork := newFork(cache.nextForkId(), parentSlot, parentRoot, block, parentForkId)
 		cache.addFork(fork)
 		cache.parentIdCache.Add(fork.forkId, fork.parentFork)
 		newForks = append(newForks, fork)
 
-		currentForkId = cache.lastForkId
+		currentForkId = fork.forkId
 		cache.indexer.logger.Infof("new fork for canonical chain (base(%v) %v [%v], head(%v) %v [%v])", parentForkId, parentSlot, parentRoot.String(), currentForkId, block.Slot, block.Root.String())
 	}
 
 	// check scenario 2
 	childBlocks := make([]*Block, 0)
 	for _, child := range cache.indexer.blockCache.getBlocksByParentRoot(block.Root) {
-		if !child.forkChecked {
+		if !child.isForkChecked() {
 			continue
 		}
 
@@ -159,12 +156,11 @@ func (cache *forkCache) processBlock(block *Block) error {
 			if cache.getForkByLeaf(child.Root) != nil {
 				cache.indexer.logger.Warnf("fork already exists for leaf %v [%v] (processing %v, scenario 2)", child.Slot, child.Root.String(), block.Slot)
 			} else {
-				cache.lastForkId++
-				fork := newFork(cache.lastForkId, block.Slot, block.Root, child, currentForkId)
+				fork := newFork(cache.nextForkId(), block.Slot, block.Root, child, currentForkId)
 				cache.addFork(fork)
 
 				_, _, headBlock := cache.updateForkBlocks(child, fork.forkId, false)
-				fork.headBlock = headBlock
+				cache.setForkHead(fork, headBlock)
 				cache.parentIdCache.Add(fork.forkId, fork.parentFork)
 				newForks = append(newForks, fork)
 
@@ -181,8 +177,8 @@ func (cache *forkCache) processBlock(block *Block) error {
 	_, _, headBlock := cache.updateForkBlocks(block, currentForkId, true)
 
 	// set detected fork id to the block
-	block.forkId = currentForkId
-	block.forkChecked = true
+	block.setForkId(currentForkId)
+	block.setForkChecked()
 
 	// update fork head block if needed
 	fork := cache.getForkById(currentForkId)
@@ -191,9 +187,7 @@ func (cache *forkCache) processBlock(block *Block) error {
 		if headBlock != nil && headBlock.Slot > lastBlock.Slot {
 			lastBlock = headBlock
 		}
-		if fork.headBlock == nil || lastBlock.Slot > fork.headBlock.Slot {
-			fork.headBlock = lastBlock
-		}
+		cache.updateForkHeadIfNewer(fork, lastBlock)
 	}
 
 	_ = newForks
@@ -212,7 +206,7 @@ func (cache *forkCache) updateForkBlocks(startBlock *Block, forkId ForkKey, skip
 
 	if !skipStartBlock {
 		blockRoots = append(blockRoots, startBlock.Root)
-		startBlock.forkId = forkId
+		startBlock.setForkId(forkId)
 		headBlock = startBlock
 	}
 
@@ -226,8 +220,8 @@ func (cache *forkCache) updateForkBlocks(startBlock *Block, forkId ForkKey, skip
 			// potential fork ahead, check if the fork is already processed and has correct parent fork id
 			if forks := cache.getForkByBase(startBlock.Root); len(forks) > 0 && forks[0].parentFork != forkId {
 				for _, fork := range forks {
-					fork.parentFork = forkId
-					cache.parentIdCache.Add(fork.forkId, fork.parentFork)
+					cache.setForkParent(fork, forkId)
+					cache.parentIdCache.Add(fork.forkId, forkId)
 				}
 
 				updatedFork = forks[0]
@@ -236,15 +230,15 @@ func (cache *forkCache) updateForkBlocks(startBlock *Block, forkId ForkKey, skip
 		}
 
 		nextBlock := nextBlocks[0]
-		if !nextBlock.forkChecked {
+		if !nextBlock.isForkChecked() {
 			break
 		}
 
-		if nextBlock.forkId == forkId {
+		if nextBlock.GetForkId() == forkId {
 			break
 		}
 
-		nextBlock.forkId = forkId
+		nextBlock.setForkId(forkId)
 		blockRoots = append(blockRoots, nextBlock.Root)
 		headBlock = nextBlock
 

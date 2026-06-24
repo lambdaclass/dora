@@ -26,8 +26,8 @@ func TestForkDetectionLinearChain(t *testing.T) {
 	b := importBlock(t, idx, rootN(2), rootN(1), 2)
 	c := importBlock(t, idx, rootN(3), rootN(2), 3)
 
-	if a.forkId != b.forkId || b.forkId != c.forkId {
-		t.Errorf("linear chain split fork ids: a=%d b=%d c=%d", a.forkId, b.forkId, c.forkId)
+	if a.GetForkId() != b.GetForkId() || b.GetForkId() != c.GetForkId() {
+		t.Errorf("linear chain split fork ids: a=%d b=%d c=%d", a.GetForkId(), b.GetForkId(), c.GetForkId())
 	}
 	// A linear chain never spawns a Fork object: every block stays on the
 	// inherited parent fork id and forkMap remains empty until a real fork or
@@ -70,8 +70,8 @@ func TestForkDetectionSibling(t *testing.T) {
 		t.Errorf("b fork base root = %v, want root 1", br)
 	}
 
-	if b.forkId == c.forkId {
-		t.Errorf("siblings b and c share fork id %d, want distinct", b.forkId)
+	if b.GetForkId() == c.GetForkId() {
+		t.Errorf("siblings b and c share fork id %d, want distinct", b.GetForkId())
 	}
 
 	// The split produced two Fork objects (one per sibling branch).
@@ -92,18 +92,77 @@ func TestForkDetectionDescendantRewalk(t *testing.T) {
 	d := importBlock(t, idx, rootN(4), rootN(2), 3)
 
 	// b and d share one fork at this point.
-	if b.forkId != d.forkId {
-		t.Fatalf("precondition: b and d should share fork id, got %d and %d", b.forkId, d.forkId)
+	if b.GetForkId() != d.GetForkId() {
+		t.Fatalf("precondition: b and d should share fork id, got %d and %d", b.GetForkId(), d.GetForkId())
 	}
 
 	// Now add sibling c(2) off a -> triggers scenario 1, both b and c get forks,
 	// and b's fork id propagates down to d via updateForkBlocks.
 	c := importBlock(t, idx, rootN(3), rootN(1), 2)
 
-	if c.forkId == b.forkId {
+	if c.GetForkId() == b.GetForkId() {
 		t.Errorf("c should be on a different fork than b")
 	}
-	if d.forkId != b.forkId {
-		t.Errorf("descendant d fork id = %d, want b's fork id %d", d.forkId, b.forkId)
+	if d.GetForkId() != b.GetForkId() {
+		t.Errorf("descendant d fork id = %d, want b's fork id %d", d.GetForkId(), b.GetForkId())
+	}
+}
+
+// TestConcurrentForkDetectionAndReads drives fork detection (writer) while
+// readers iterate forkHeads and recompute the canonical head. Under `go test
+// -race` this exercises the I3 (forkCache field) and C3 (latestBlock/version)
+// concurrency fixes; without them the race detector fires.
+func TestConcurrentForkDetectionAndReads(t *testing.T) {
+	idx := newTestIndexer()
+	idx.forkCache.lastForkId.Store(1)
+	idx.forkCache.finalizedForkId.Store(1)
+
+	// Seed an anchor at slot 0 so canonical selection has something to walk.
+	gen := addBlock(idx.blockCache, rootN(0), leanapi.Root{}, 0)
+	gen.setForkChecked()
+
+	const n = 60
+	done := make(chan struct{})
+
+	// Reader goroutines: fork heads + canonical recompute, hammering the maps
+	// and Fork fields the writer mutates.
+	readers := 4
+	readerDone := make(chan struct{}, readers)
+	for r := 0; r < readers; r++ {
+		go func() {
+			defer func() { readerDone <- struct{}{} }()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				_ = idx.forkCache.getForkHeads()
+				_, _, _ = idx.computeCanonicalChain()
+				_ = idx.forkCache.getFinalizedForkId()
+				_ = idx.forkCache.getLastForkId()
+			}
+		}()
+	}
+
+	// Writer: build a chain with a fork at slot 2 so updateForkBlocks runs.
+	parent := rootN(0)
+	for s := 1; s <= n; s++ {
+		root := rootN(byte(s))
+		b := addBlock(idx.blockCache, root, parent, leanapi.Slot(s))
+		if err := idx.forkCache.processBlock(b); err != nil {
+			t.Errorf("processBlock slot %d: %v", s, err)
+		}
+		if s == 2 {
+			// sibling at slot 2 -> spawns forks, exercises Fork field writes
+			sib := addBlock(idx.blockCache, rootN(0xF0), rootN(1), 2)
+			_ = idx.forkCache.processBlock(sib)
+		}
+		parent = root
+	}
+
+	close(done)
+	for r := 0; r < readers; r++ {
+		<-readerDone
 	}
 }

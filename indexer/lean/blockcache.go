@@ -20,6 +20,12 @@ type blockCache struct {
 	rootMap     map[leanapi.Root]*Block
 	parentMap   map[leanapi.Root][]*Block
 	latestBlock *Block // latest added block (a marker for cache changes, not necessarily the head)
+	// version is a monotonic counter bumped on every mutation that can affect
+	// canonical selection (new node, body attach, parent link, removal). It is
+	// the short-circuit key for computeCanonicalChain: unlike the latestBlock
+	// pointer it advances even when a body/parent edge changes on an existing
+	// node (so vote-only changes still trigger recomputation).
+	version uint64
 }
 
 // newBlockCache creates a new instance of blockCache.
@@ -56,17 +62,26 @@ func (cache *blockCache) createOrGetBlock(root leanapi.Root, slot leanapi.Slot) 
 	}
 
 	cache.latestBlock = cacheBlock
+	cache.version++
 
 	return cacheBlock, true
 }
 
 // addBlockToParentMap links the given block under its parent root so it can be
 // found as a child during fork detection.
+//
+// Self-parent edges are never filed: the genesis/anchor block is created with
+// root == parentRoot == zero, and filing it under parentMap[zero] would make it
+// its own child, causing findHead to loop forever. Such a block simply has no
+// parent edge in the cache.
 func (cache *blockCache) addBlockToParentMap(block *Block) {
 	cache.cacheMutex.Lock()
 	defer cache.cacheMutex.Unlock()
 
 	parentRoot := block.GetParentRoot()
+	if parentRoot == block.Root {
+		return
+	}
 
 	for _, parentBlock := range cache.parentMap[parentRoot] {
 		if parentBlock == block {
@@ -75,6 +90,55 @@ func (cache *blockCache) addBlockToParentMap(block *Block) {
 	}
 
 	cache.parentMap[parentRoot] = append(cache.parentMap[parentRoot], block)
+	cache.version++
+}
+
+// markChanged bumps the cache version. Callers use this after mutating a cached
+// block's body/parent (via Block.SetBlock) so canonical recomputation is not
+// short-circuited away. It is separate from the block mutation itself because
+// Block has its own (finer-grained) locking.
+func (cache *blockCache) markChanged() {
+	cache.cacheMutex.Lock()
+	defer cache.cacheMutex.Unlock()
+	cache.version++
+}
+
+// snapshotBodies returns a copy of every cached block's decoded body, read
+// while holding the cache read lock. This serializes body reads against
+// removeBlock/Dispose (which take the write lock), avoiding a data race on
+// Block.body / Block.isDisposed in callers like collectLatestVotes.
+func (cache *blockCache) snapshotBodies() []*leanapi.Block {
+	cache.cacheMutex.RLock()
+	defer cache.cacheMutex.RUnlock()
+
+	bodies := make([]*leanapi.Block, 0, len(cache.rootMap))
+	for _, block := range cache.rootMap {
+		if body := block.GetBody(); body != nil {
+			bodies = append(bodies, body)
+		}
+	}
+	return bodies
+}
+
+// getLatestBlock returns the most recently added block under the read lock.
+func (cache *blockCache) getLatestBlock() *Block {
+	cache.cacheMutex.RLock()
+	defer cache.cacheMutex.RUnlock()
+	return cache.latestBlock
+}
+
+// getVersion returns the current cache version under the read lock.
+func (cache *blockCache) getVersion() uint64 {
+	cache.cacheMutex.RLock()
+	defer cache.cacheMutex.RUnlock()
+	return cache.version
+}
+
+// size returns the number of blocks currently held in the cache.
+func (cache *blockCache) size() int {
+	cache.cacheMutex.RLock()
+	defer cache.cacheMutex.RUnlock()
+	return len(cache.rootMap)
 }
 
 // getBlockByRoot returns the cached block with the given root, or nil.
@@ -152,7 +216,7 @@ func (cache *blockCache) getForkBlocks(forkId ForkKey) []*Block {
 	blocks := []*Block{}
 	for _, slotBlocks := range cache.slotMap {
 		for _, block := range slotBlocks {
-			if block.forkId != forkId {
+			if block.GetForkId() != forkId {
 				continue
 			}
 
@@ -174,47 +238,61 @@ func (cache *blockCache) isCanonicalBlock(blockRoot leanapi.Root, head leanapi.R
 // head, and the number of hops from head down to blockRoot. maxDistance bounds
 // the walk (0 = unbounded).
 func (cache *blockCache) getCanonicalDistance(blockRoot leanapi.Root, head leanapi.Root, maxDistance uint64) (bool, uint64) {
+	canonical, distance, _ := cache.getCanonicalDistanceEx(blockRoot, head, maxDistance)
+	return canonical, distance
+}
+
+// getCanonicalDistanceEx is getCanonicalDistance with an extra uncached flag
+// that disambiguates the two false cases:
+//   - (false, 0, false): blockRoot is provably NOT on head's chain (the walk
+//     reached head's cached anchor without matching).
+//   - (false, 0, true):  the walk hit an ancestor that is not in the cache, so
+//     canonicality could not be determined (e.g. the common ancestor lies below
+//     the finalized boundary and was pruned). Callers must not treat this as
+//     "definitely not canonical".
+func (cache *blockCache) getCanonicalDistanceEx(blockRoot leanapi.Root, head leanapi.Root, maxDistance uint64) (canonical bool, distance uint64, uncached bool) {
 	if head == blockRoot {
-		return true, 0
+		return true, 0, false
 	}
 
 	canonicalBlock := cache.getBlockByRoot(head)
 	if canonicalBlock == nil {
-		return false, 0
+		// head itself isn't cached: undetermined.
+		return false, 0, true
 	}
 
 	block := cache.getBlockByRoot(blockRoot)
 
-	var distance uint64 = 0
-
 	for canonicalBlock != nil {
 		if block != nil && canonicalBlock.Slot < block.Slot {
-			return false, 0
+			return false, 0, false
 		}
 
 		parentRoot := canonicalBlock.GetParentRoot()
 
 		distance++
 		if maxDistance > 0 && distance > maxDistance {
-			return false, 0
+			return false, 0, false
 		}
 
 		if parentRoot == blockRoot {
-			return true, distance
+			return true, distance, false
 		}
 
-		// Reached the anchor (self-parent or zero parent) without a match.
+		// Reached the anchor (self-parent or zero parent) without a match: the
+		// chain is fully walked and blockRoot is not on it.
 		if parentRoot.IsZero() || parentRoot == canonicalBlock.Root {
-			return false, 0
+			return false, 0, false
 		}
 
 		canonicalBlock = cache.getBlockByRoot(parentRoot)
 		if canonicalBlock == nil {
-			return false, 0
+			// the parent (an ancestor of head) isn't cached: undetermined.
+			return false, 0, true
 		}
 	}
 
-	return false, 0
+	return false, 0, false
 }
 
 // removeBlock removes the given block from all cache indexes and disposes it.
@@ -251,6 +329,8 @@ func (cache *blockCache) removeBlock(block *Block) {
 			}
 		}
 	}
+
+	cache.version++
 
 	block.Dispose()
 }

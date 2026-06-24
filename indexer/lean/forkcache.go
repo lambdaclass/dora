@@ -3,6 +3,7 @@ package lean
 import (
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common/lru"
 
@@ -16,11 +17,17 @@ import (
 // finalized slot. DB load/persist of the fork state is intentionally omitted
 // and handled by a later task, so this cache is purely in-memory.
 type forkCache struct {
-	indexer         *Indexer
-	cacheMutex      sync.RWMutex
-	forkMap         map[ForkKey]*Fork
-	finalizedForkId ForkKey
-	lastForkId      ForkKey
+	indexer *Indexer
+	// cacheMutex guards forkMap and the Fork struct fields (parentFork,
+	// headBlock) that fork detection mutates while readers (getForkHeads,
+	// setFinalizedSlot) iterate.
+	cacheMutex sync.RWMutex
+	forkMap    map[ForkKey]*Fork
+	// finalizedForkId and lastForkId are atomics: fork detection writes them
+	// while holding only forkProcessLock (which excludes other writers but not
+	// readers), so the reads/writes must be lock-free-safe.
+	finalizedForkId atomic.Uint64
+	lastForkId      atomic.Uint64
 	parentIdCache   *lru.Cache[ForkKey, ForkKey]
 	forkProcessLock sync.Mutex
 }
@@ -31,6 +38,45 @@ func newForkCache(indexer *Indexer) *forkCache {
 		indexer:       indexer,
 		forkMap:       make(map[ForkKey]*Fork),
 		parentIdCache: lru.NewCache[ForkKey, ForkKey](1000),
+	}
+}
+
+// nextForkId atomically increments and returns the next fork id.
+func (cache *forkCache) nextForkId() ForkKey {
+	return ForkKey(cache.lastForkId.Add(1))
+}
+
+// getLastForkId returns the current highest assigned fork id.
+func (cache *forkCache) getLastForkId() ForkKey {
+	return ForkKey(cache.lastForkId.Load())
+}
+
+// getFinalizedForkId returns the finalized fork id.
+func (cache *forkCache) getFinalizedForkId() ForkKey {
+	return ForkKey(cache.finalizedForkId.Load())
+}
+
+// setForkHead sets a fork's head block under the cache lock.
+func (cache *forkCache) setForkHead(fork *Fork, head *Block) {
+	cache.cacheMutex.Lock()
+	defer cache.cacheMutex.Unlock()
+	fork.headBlock = head
+}
+
+// setForkParent sets a fork's parent fork id under the cache lock.
+func (cache *forkCache) setForkParent(fork *Fork, parent ForkKey) {
+	cache.cacheMutex.Lock()
+	defer cache.cacheMutex.Unlock()
+	fork.parentFork = parent
+}
+
+// updateForkHeadIfNewer advances a fork's head block to candidate if candidate
+// is at a higher slot (or no head is set), under the cache lock.
+func (cache *forkCache) updateForkHeadIfNewer(fork *Fork, candidate *Block) {
+	cache.cacheMutex.Lock()
+	defer cache.cacheMutex.Unlock()
+	if fork.headBlock == nil || candidate.Slot > fork.headBlock.Slot {
+		fork.headBlock = candidate
 	}
 }
 
@@ -108,16 +154,19 @@ func (cache *forkCache) getForkHeads() []*ForkHead {
 		}
 	}
 
+	finalizedForkId := cache.getFinalizedForkId()
 	forkHeads := []*ForkHead{}
-	if !forkParents[cache.finalizedForkId] {
-		canonicalBlocks := cache.indexer.blockCache.getForkBlocks(cache.finalizedForkId)
+	if !forkParents[finalizedForkId] {
+		canonicalBlocks := cache.indexer.blockCache.getForkBlocks(finalizedForkId)
 		sort.Slice(canonicalBlocks, func(i, j int) bool {
 			return canonicalBlocks[i].Slot > canonicalBlocks[j].Slot
 		})
 		if len(canonicalBlocks) > 0 {
 			forkHeads = append(forkHeads, &ForkHead{
-				ForkId: cache.finalizedForkId,
-				Block:  canonicalBlocks[0],
+				ForkId: finalizedForkId,
+				// Fork is intentionally nil for the finalized fork (it has no
+				// Fork object); consumers must nil-check ForkHead.Fork.
+				Block: canonicalBlocks[0],
 			})
 		}
 	}
@@ -162,7 +211,7 @@ func (cache *forkCache) setFinalizedSlot(finalizedSlot leanapi.Slot, justifiedRo
 			break
 		}
 
-		finalizedForkId = latestFinalizedBlock.forkId
+		finalizedForkId = latestFinalizedBlock.GetForkId()
 
 		if latestFinalizedBlock.Slot <= finalizedSlot {
 			break
@@ -176,5 +225,5 @@ func (cache *forkCache) setFinalizedSlot(finalizedSlot leanapi.Slot, justifiedRo
 		latestFinalizedBlock = cache.indexer.blockCache.getBlockByRoot(parentRoot)
 	}
 
-	cache.finalizedForkId = finalizedForkId
+	cache.finalizedForkId.Store(uint64(finalizedForkId))
 }

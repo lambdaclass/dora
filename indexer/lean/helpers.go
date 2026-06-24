@@ -38,28 +38,36 @@ func setBits(bits leanapi.HexBytes) []uint64 {
 
 // resolveBackfillRoots derives a block root for each block returned by the
 // range endpoint (which omits roots). Blocks arrive slot-ordered, so the root
-// of block[i] equals block[i+1].parent_root. The final block's root is
-// resolved via a header lookup keyed by slot. Unresolved roots fall back to the
-// state root so the row still has a unique-ish key (best effort for backfill;
-// the SSE path supplies authoritative roots near head).
-func (idx *Indexer) resolveBackfillRoots(blocks []*leanapi.Block) []leanapi.Root {
-	roots := make([]leanapi.Root, len(blocks))
+// of block[i] equals block[i+1].parent_root (authoritative). The final block
+// has no child to borrow a parent_root from, so it is resolved from fork choice
+// by slot if present.
+//
+// It returns a parallel resolved[] flag. The last block's root is resolved=true
+// only when fork choice supplies it; otherwise resolved[i]=false and the root
+// falls back to the state root as a best-effort UNIQUE key. Callers MUST NOT
+// place an unresolved (resolved=false) block into the in-memory cache: a
+// state-root key would not match its real block root, breaking parent linkage
+// and letting the SSE path create a duplicate node. Unresolved blocks below the
+// finalized slot may still be written to the DB finalized tier (best effort).
+func (idx *Indexer) resolveBackfillRoots(blocks []*leanapi.Block) (roots []leanapi.Root, resolved []bool) {
+	roots = make([]leanapi.Root, len(blocks))
+	resolved = make([]bool, len(blocks))
 	for i := 0; i+1 < len(blocks); i++ {
 		roots[i] = blocks[i+1].ParentRoot
+		resolved[i] = true
 	}
 	if n := len(blocks); n > 0 {
-		// Resolve the last block's root from fork choice if it is present there;
-		// otherwise fall back to its state root.
 		last := blocks[n-1]
-		roots[n-1] = last.StateRoot
+		roots[n-1] = last.StateRoot // best-effort fallback key (not the real root)
 		if fc, err := idx.client.GetForkChoice(idx.ctx); err == nil {
 			for _, node := range fc.Nodes {
 				if uint64(node.Slot) == uint64(last.Slot) {
 					roots[n-1] = node.Root
+					resolved[n-1] = true
 					break
 				}
 			}
 		}
 	}
-	return roots
+	return roots, resolved
 }

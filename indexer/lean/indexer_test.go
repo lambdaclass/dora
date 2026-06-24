@@ -273,8 +273,8 @@ func TestCacheDrivenIngestion(t *testing.T) {
 	idx.spec = leanapi.NewChainSpec(mc.genesis, mc.spec)
 	gen, _ := idx.blockCache.createOrGetBlock(genesisRoot, 0)
 	gen.SetBlock(&leanapi.Block{Slot: 0, ParentRoot: leanapi.Root{}, StateRoot: rootOf(0x99)})
-	gen.forkId = idx.forkCache.finalizedForkId
-	gen.forkChecked = true
+	gen.setForkId(idx.forkCache.getFinalizedForkId())
+	gen.setForkChecked()
 	idx.blockCache.addBlockToParentMap(gen)
 
 	// Ingest the linear chain A -> B via block events.
@@ -306,19 +306,38 @@ func TestCacheDrivenIngestion(t *testing.T) {
 		t.Fatalf("expected B orphaned after reorg, got %+v", sb)
 	}
 
-	// Finalize at slot 2 (root C): flush slots <= 2 to DB, prune from cache.
+	// Finalize at slot 2 (root C): flush slots <= 2 to DB, prune STRICTLY below
+	// the finalized slot (I1). The finalized-slot block (C, slot 2) and its
+	// children must remain in the cache as the anchor.
 	idx.onFinalizedEvent(&leanapi.FinalizedCheckpointEventData{Slot: 2, Root: rC})
 
-	// Cache pruned: no blocks at slot <= 2 remain in the cache.
-	if got := idx.blockCache.getBlocksBySlot(2); len(got) != 0 {
-		t.Errorf("expected slot 2 pruned from cache, got %d blocks", len(got))
+	// Strictly-below pruned: slot 1 (A) is gone. The invariant is "cache retains
+	// slot >= finalizedSlot", so the slot-2 blocks (canonical C and orphaned
+	// sibling B) both REMAIN in cache; only their DB rows reflect finalization.
+	if idx.blockCache.getBlockByRoot(rA) != nil {
+		t.Errorf("expected A (slot 1, below finalized) pruned from cache")
 	}
-	if got := idx.blockCache.getBlocksBySlot(1); len(got) != 0 {
-		t.Errorf("expected slot 1 pruned from cache, got %d blocks", len(got))
+	if idx.blockCache.getBlockByRoot(rB) == nil {
+		t.Errorf("expected B (slot 2 == finalized) to remain cached per the >= invariant")
 	}
-	// D (slot 3 > finalized 2) stays in the cache.
-	if idx.blockCache.getBlockByRoot(rD) == nil {
-		t.Errorf("expected D (slot 3) to remain cached")
+	// I1: the finalized-slot anchor C MUST remain cached.
+	anchorC := idx.blockCache.getBlockByRoot(rC)
+	if anchorC == nil {
+		t.Fatalf("expected finalized-slot block C to REMAIN in cache as anchor")
+	}
+	// D (slot 3 > finalized 2) stays, and still resolves its parent (C) in-cache.
+	d := idx.blockCache.getBlockByRoot(rD)
+	if d == nil {
+		t.Fatalf("expected D (slot 3) to remain cached")
+	}
+	if idx.blockCache.getBlockByRoot(d.GetParentRoot()) != anchorC {
+		t.Errorf("expected D's parent to resolve to the cached anchor C")
+	}
+	// A subsequent canonical computation must still anchor on C (no fallback),
+	// and keep D canonical.
+	head, _, _ := idx.computeCanonicalChain()
+	if head != rD {
+		t.Errorf("post-finalize head = %v, want D (root 0x40)", head)
 	}
 
 	// DB: C finalized canonical, B finalized orphaned.

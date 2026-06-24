@@ -49,12 +49,8 @@ type ReorgInfo struct {
 func (idx *Indexer) collectLatestVotes() map[uint64]latestVote {
 	votes := map[uint64]latestVote{}
 
-	for _, block := range idx.blockCache.getAllBlocks() {
-		body := block.GetBody()
-		if body == nil {
-			continue
-		}
-
+	// Snapshot bodies under the cache lock so disposal cannot race the reads.
+	for _, body := range idx.blockCache.snapshotBodies() {
 		for _, att := range body.Body.Attestations {
 			headRoot := att.Data.Head.Root
 			attSlot := att.Data.Slot
@@ -105,6 +101,10 @@ func (idx *Indexer) computeSubtreeWeights(votes map[uint64]latestVote) map[leana
 // intent. It stops at a block with no children: the canonical head.
 func (idx *Indexer) findHead(anchor leanapi.Root, weights map[leanapi.Root]uint64) leanapi.Root {
 	head := anchor
+	// visited guards against cycles / self-parent edges (e.g. the zero-root
+	// genesis anchor filed as its own child); without it findHead can loop
+	// forever holding canonicalHeadMutex and wedge the indexer.
+	visited := map[leanapi.Root]bool{head: true}
 
 	for {
 		children := idx.blockCache.getBlocksByParentRoot(head)
@@ -115,6 +115,10 @@ func (idx *Indexer) findHead(anchor leanapi.Root, weights map[leanapi.Root]uint6
 		var best *Block
 		var bestWeight uint64
 		for _, child := range children {
+			if child.Root == head || visited[child.Root] {
+				// self-parent or already-visited edge: not a real descendant.
+				continue
+			}
 			w := weights[child.Root]
 			if best == nil || isBetterChild(child, w, best, bestWeight) {
 				best = child
@@ -122,10 +126,11 @@ func (idx *Indexer) findHead(anchor leanapi.Root, weights map[leanapi.Root]uint6
 			}
 		}
 
-		if best == nil {
+		if best == nil || best.Root == head {
 			break
 		}
 		head = best.Root
+		visited[head] = true
 	}
 
 	return head
@@ -171,8 +176,13 @@ func (idx *Indexer) computeCanonicalChain() (headRoot leanapi.Root, canonical ma
 	idx.canonicalHeadMutex.Lock()
 	defer idx.canonicalHeadMutex.Unlock()
 
-	// Short-circuit: nothing was added to the cache since the last computation.
-	if latest := idx.blockCache.latestBlock; latest != nil && latest.Root == idx.canonicalComputation {
+	// Short-circuit on the cache version: it advances on every mutation that can
+	// affect selection (new node, body attach, parent edge, removal), so unlike
+	// the old latestBlock-root marker it also catches vote-only changes (a body
+	// attached to an existing node) and back-to-back compute calls with new
+	// blocks in between.
+	version := idx.blockCache.getVersion()
+	if idx.canonicalComputed && version == idx.canonicalComputedVersion {
 		return idx.canonicalHead, idx.canonicalSet(idx.canonicalHead), false
 	}
 
@@ -192,11 +202,10 @@ func (idx *Indexer) computeCanonicalChain() (headRoot leanapi.Root, canonical ma
 
 	canonical = idx.canonicalSet(headRoot)
 
-	changed = headRoot != idx.canonicalHead
+	changed = !idx.canonicalComputed || headRoot != idx.canonicalHead
 	idx.canonicalHead = headRoot
-	if latest := idx.blockCache.latestBlock; latest != nil {
-		idx.canonicalComputation = latest.Root
-	}
+	idx.canonicalComputed = true
+	idx.canonicalComputedVersion = version
 
 	return headRoot, canonical, changed
 }
@@ -225,7 +234,7 @@ func (idx *Indexer) canonicalSet(headRoot leanapi.Root) map[leanapi.Root]bool {
 // fallbackAnchor returns an anchor root to use before finalized seeding is
 // wired: the lowest-slot ancestor reachable from the latest cached block.
 func (idx *Indexer) fallbackAnchor() leanapi.Root {
-	latest := idx.blockCache.latestBlock
+	latest := idx.blockCache.getLatestBlock()
 	if latest == nil {
 		return leanapi.Root{}
 	}
@@ -260,10 +269,25 @@ func (idx *Indexer) processReorg(oldHead, newHead *Block) *ReorgInfo {
 	var commonAncestor leanapi.Root
 
 	for {
-		if res, dist := idx.blockCache.getCanonicalDistance(reorgBase.Root, newHead.Root, 0); res {
+		res, dist, uncached := idx.blockCache.getCanonicalDistanceEx(reorgBase.Root, newHead.Root, 0)
+		if res {
 			forwardDistance = dist
 			commonAncestor = reorgBase.Root
 			break
+		}
+		if uncached {
+			// The common ancestor lies below what the cache holds (e.g. across
+			// the finalized boundary). We cannot measure the depth, but a reorg
+			// almost certainly happened: the old head is not provably on the new
+			// head's chain. Report it as unknown-depth rather than silently nil.
+			idx.logger.Warnf("possible reorg with unknown depth: common ancestor not cached (old: %v, new: %v)", oldHead.Root.String(), newHead.Root.String())
+			return &ReorgInfo{
+				Depth:           0,
+				ForwardDistance: 0,
+				OldHead:         oldHead.Root,
+				NewHead:         newHead.Root,
+				CommonAncestor:  leanapi.Root{},
+			}
 		}
 
 		parentRoot := reorgBase.GetParentRoot()
@@ -273,7 +297,14 @@ func (idx *Indexer) processReorg(oldHead, newHead *Block) *ReorgInfo {
 
 		reorgBase = idx.blockCache.getBlockByRoot(parentRoot)
 		if reorgBase == nil {
-			return nil
+			// Walked off the cached chain without resolving: unknown-depth reorg.
+			idx.logger.Warnf("possible reorg with unknown depth: ancestor chain not cached (old: %v, new: %v)", oldHead.Root.String(), newHead.Root.String())
+			return &ReorgInfo{
+				Depth:          0,
+				OldHead:        oldHead.Root,
+				NewHead:        newHead.Root,
+				CommonAncestor: leanapi.Root{},
+			}
 		}
 
 		rewindDistance++

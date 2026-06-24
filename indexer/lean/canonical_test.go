@@ -2,6 +2,7 @@ package lean
 
 import (
 	"testing"
+	"time"
 
 	leanapi "github.com/ethpandaops/dora/clients/consensus/lean"
 )
@@ -185,5 +186,102 @@ func TestComputeCanonicalChainTiebreak(t *testing.T) {
 	// Equal weight (1 each), equal slot -> lexicographically greater root (9 > 2).
 	if head != high.Root {
 		t.Errorf("tiebreak head = %v, want high (root 9)", head)
+	}
+}
+
+// TestC1_FindHeadZeroRootGenesisTerminates is the regression for C1: a zero-root
+// genesis/anchor whose parent root is also zero must not loop forever in
+// findHead (the self-parent edge must not be filed, and findHead must guard
+// against cycles). The computation must terminate and return the real tip.
+func TestC1_FindHeadZeroRootGenesisTerminates(t *testing.T) {
+	idx := newTestIndexer()
+
+	zero := leanapi.Root{}
+	// Genesis: root == parent == zero (the dangerous self-parent shape).
+	gen, _ := idx.blockCache.createOrGetBlock(zero, 0)
+	gen.SetBlock(&leanapi.Block{Slot: 0, ParentRoot: zero, StateRoot: rootN(0x99)})
+	idx.blockCache.addBlockToParentMap(gen)
+
+	// A real chain on top: a(1) -> b(2).
+	addBlock(idx.blockCache, rootN(1), zero, 1)
+	b := addBlock(idx.blockCache, rootN(2), rootN(1), 2)
+
+	// Sanity: genesis must NOT be filed as its own child (C1 fix part a).
+	for _, child := range idx.blockCache.getBlocksByParentRoot(zero) {
+		if child.Root == zero {
+			t.Fatalf("zero-root genesis was filed as its own child (self-parent edge)")
+		}
+	}
+
+	// Run with a watchdog so a regression (infinite loop) fails instead of hanging.
+	done := make(chan leanapi.Root, 1)
+	go func() {
+		head, _, _ := idx.computeCanonicalChain()
+		done <- head
+	}()
+	select {
+	case head := <-done:
+		if head != b.Root {
+			t.Errorf("head = %v, want tip b (root 2)", head)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("computeCanonicalChain did not terminate (C1 regression: findHead looped)")
+	}
+}
+
+// TestC2_VoteChangeWithoutNewHeadBlockRecomputes is the regression for C2: the
+// canonical recompute must not be short-circuited when votes change without a
+// new head-slot block entering the cache. Shifting the latest votes to the
+// other sibling (via a body re-attach + markChanged, the path ingestCacheBlock
+// uses) must change the head.
+func TestC2_VoteChangeWithoutNewHeadBlockRecomputes(t *testing.T) {
+	idx := newTestIndexer()
+
+	addBlock(idx.blockCache, rootN(1), leanapi.Root{}, 1)
+	left := addBlock(idx.blockCache, rootN(2), rootN(1), 2)
+	right := addBlock(idx.blockCache, rootN(3), rootN(1), 2)
+
+	// Initially left is favored 2-1.
+	voteBlock(left, 2, left.Root, []uint64{0, 1})
+	voteBlock(right, 2, right.Root, []uint64{2})
+
+	head1, _, changed1 := idx.computeCanonicalChain()
+	if head1 != left.Root || !changed1 {
+		t.Fatalf("initial head = %v changed=%v, want left changed=true", head1, changed1)
+	}
+
+	// Now flip the majority to the right sibling by REPLACING the vote bodies in
+	// place — NO new block enters the cache, so latestBlock does not move. This
+	// is exactly the path the old latestBlock-root short-circuit missed.
+	left.body.Body.Attestations = nil
+	voteBlock(left, 2, left.Root, []uint64{0})
+	right.body.Body.Attestations = nil
+	voteBlock(right, 2, right.Root, []uint64{1, 2})
+	// Signal the cache changed (ingestCacheBlock does this via markChanged on a
+	// body re-attach to an existing node).
+	idx.blockCache.markChanged()
+
+	head2, _, changed2 := idx.computeCanonicalChain()
+	if head2 != right.Root {
+		t.Errorf("after vote shift head = %v, want right (root 3); short-circuit missed the vote change (C2)", head2)
+	}
+	if !changed2 {
+		t.Errorf("changed = false after the head moved (C2)")
+	}
+}
+
+// TestC2_ShortCircuitStillHoldsWhenUnchanged verifies the version short-circuit
+// still returns changed=false when nothing changed between two compute calls.
+func TestC2_ShortCircuitStillHoldsWhenUnchanged(t *testing.T) {
+	idx := newTestIndexer()
+	addBlock(idx.blockCache, rootN(1), leanapi.Root{}, 1)
+	c := addBlock(idx.blockCache, rootN(2), rootN(1), 2)
+	voteBlock(c, 2, c.Root, []uint64{0})
+
+	if _, _, changed := idx.computeCanonicalChain(); !changed {
+		t.Fatalf("first computation should report changed=true")
+	}
+	if _, _, changed := idx.computeCanonicalChain(); changed {
+		t.Errorf("second computation with no cache change should report changed=false")
 	}
 }
