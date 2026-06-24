@@ -45,6 +45,13 @@ type Indexer struct {
 	// them.
 	blockCache *blockCache
 	forkCache  *forkCache
+
+	// Canonical head selection (LMD-GHOST) state. canonicalComputation is the
+	// latest-block marker used to short-circuit recomputation when the cache is
+	// unchanged (mirrors Dora's canonicalComputation).
+	canonicalHeadMutex   sync.Mutex
+	canonicalHead        lean.Root
+	canonicalComputation lean.Root
 }
 
 // finalizedCheckpoint returns the currently tracked finalized slot and root.

@@ -131,6 +131,19 @@ func (cache *blockCache) getCleanupBlocks(finalizedSlot leanapi.Slot) []*Block {
 	return blocks
 }
 
+// getAllBlocks returns a snapshot of every block currently in the cache.
+func (cache *blockCache) getAllBlocks() []*Block {
+	cache.cacheMutex.RLock()
+	defer cache.cacheMutex.RUnlock()
+
+	blocks := make([]*Block, 0, len(cache.rootMap))
+	for _, block := range cache.rootMap {
+		blocks = append(blocks, block)
+	}
+
+	return blocks
+}
+
 // getForkBlocks returns the cached blocks that belong to the specified forkId.
 func (cache *blockCache) getForkBlocks(forkId ForkKey) []*Block {
 	cache.cacheMutex.RLock()
