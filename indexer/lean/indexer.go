@@ -35,8 +35,24 @@ type Indexer struct {
 	headSlot      uint64
 	headRoot      lean.Root
 	finalizedSlot uint64
+	finalizedRoot lean.Root
 	justifiedSlot uint64
 	running       bool
+
+	// In-memory reorg-aware caches (ported from Dora's beacon indexer). They
+	// hold a back-reference to this Indexer, exactly as Dora's caches do. The
+	// caches are not yet wired into the ingestion path; a later task connects
+	// them.
+	blockCache *blockCache
+	forkCache  *forkCache
+}
+
+// finalizedCheckpoint returns the currently tracked finalized slot and root.
+// It is consumed by the fork cache during fork detection.
+func (idx *Indexer) finalizedCheckpoint() (lean.Slot, lean.Root) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return lean.Slot(idx.finalizedSlot), idx.finalizedRoot
 }
 
 // NewIndexer constructs a lean indexer over the given client.
