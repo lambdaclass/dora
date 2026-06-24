@@ -68,7 +68,7 @@ type Checkpoint struct {
 // Validator is a lean validator registry entry. Validators carry two XMSS
 // public keys (attestation + proposal); both are opaque bytes here.
 type Validator struct {
-	Index            uint64 `db:"index"`
+	Index             uint64 `db:"index"`
 	AttestationPubkey []byte `db:"attestation_pubkey"`
 	ProposalPubkey    []byte `db:"proposal_pubkey"`
 }
