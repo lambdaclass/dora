@@ -81,8 +81,12 @@ func (s *Server) buildIndexData(ctx context.Context) *IndexPageData {
 		NetworkForks:  s.networkForks(),
 		ForkTreeWidth: 0,
 
-		// Lean has no epochs: leave the recent-epochs panel empty (renders greyed).
-		RecentEpochs:     nil,
+		// Lean has no epochs: leave the recent-epochs panel empty. Use a non-nil
+		// empty slice so it marshals to [] not null — page-index.js binds the
+		// recent-epochs panel with `if: epochs().length == 0`, and `null.length`
+		// throws a knockout exception that breaks the whole view (the slots/blocks
+		// lists silently empty on the first /index/data poll).
+		RecentEpochs:     []*IndexPageDataEpochs{},
 		RecentEpochCount: 0,
 
 		RecentSlots:      s.toIndexSlots(slots),
@@ -340,6 +344,10 @@ func (s *Server) toSlotPage(ctx context.Context, slot *dbtypes.Slot, votes []*db
 			TargetCommitteeSize:  s.validatorCount(ctx),
 			MaxCommitteesPerSlot: 1,
 			Attestations:         s.votesToAttestations(slot, votes),
+			// Non-nil so includeJSON renders [] not null: attestations.html does
+			// JSON.parse(.ValidatorNames).forEach(...), and null.forEach throws a
+			// JS exception that aborts the attestations script (no rows render).
+			ValidatorNames: []SlotPageValidatorName{},
 		}
 		data.Block = block
 	}
