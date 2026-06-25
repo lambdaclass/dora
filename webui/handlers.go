@@ -334,16 +334,19 @@ func (s *Server) toSlotPage(ctx context.Context, slot *dbtypes.Slot, votes []*db
 
 	// A canonical or orphaned slot has a block; a missed slot does not.
 	if slot.Status != dbtypes.Missing {
+		atts := s.votesToAttestations(slot, votes, s.validatorCount(ctx))
 		block := &SlotPageBlockData{
-			BlockRoot:         slot.Root,
-			ParentRoot:        slot.ParentRoot,
-			StateRoot:         slot.StateRoot,
-			AttestationsCount: uint64(len(votes)),
-			// One vote per validator: a single committee of size ValidatorCount.
+			BlockRoot:  slot.Root,
+			ParentRoot: slot.ParentRoot,
+			StateRoot:  slot.StateRoot,
+			// Count aggregated attestations (cards), not raw votes: normally one
+			// card covering all validators, matching the block's attestation count.
+			AttestationsCount: uint64(len(atts)),
+			// One committee of size ValidatorCount (no shuffling in lean).
 			SlotsPerEpoch:        1,
 			TargetCommitteeSize:  s.validatorCount(ctx),
 			MaxCommitteesPerSlot: 1,
-			Attestations:         s.votesToAttestations(slot, votes),
+			Attestations:         atts,
 			// Non-nil so includeJSON renders [] not null: attestations.html does
 			// JSON.parse(.ValidatorNames).forEach(...), and null.forEach throws a
 			// JS exception that aborts the attestations script (no rows render).
@@ -354,27 +357,67 @@ func (s *Server) toSlotPage(ctx context.Context, slot *dbtypes.Slot, votes []*db
 	return data
 }
 
-// votesToAttestations turns lean votes into single-validator attestation rows.
-// Each lean validator casts one vote, so every row has exactly one aggregation
-// bit set (committee index 0) and lists that one validator. The JS in
-// attestations.html base64-decodes these fields to render the bitfield + links.
-func (s *Server) votesToAttestations(slot *dbtypes.Slot, votes []*dbtypes.Vote) []*SlotPageAttestation {
-	atts := make([]*SlotPageAttestation, 0, len(votes))
+// votesToAttestations aggregates lean per-validator votes into attestation rows.
+// Lean stores one vote per validator; aggregators combine the votes that share
+// the same attestation data (head/source/target). We regroup by that data so
+// each card represents one aggregated attestation over the FULL validator
+// committee: Validators lists every validator (0..N-1) in index order and one
+// aggregation bit is set per validator that cast this vote. The attestations.html
+// summary then reads "K validators attesting, N-K not (pct%)" instead of the
+// misleading per-vote "1 of 1". A single committee (index 0) holds all validators
+// since lean has no committee shuffling.
+func (s *Server) votesToAttestations(slot *dbtypes.Slot, votes []*dbtypes.Vote, validatorCount uint64) []*SlotPageAttestation {
+	// Committee size = validator count, but never smaller than the highest voter
+	// index + 1, so the committee always covers every voter even if the count is
+	// momentarily stale (and Validators stays non-empty, which keeps the JS from
+	// firing the lazy committee-duties fetch).
+	vc := validatorCount
 	for _, v := range votes {
-		atts = append(atts, &SlotPageAttestation{
-			Slot:            v.Slot,
-			CommitteeIndex:  []uint64{0},
-			TotalActive:     1,
-			AggregationBits: []byte{0x01}, // single attesting validator
-			Validators:      []uint64{v.ValidatorIndex},
-			Signature:       nil,
-			BeaconBlockRoot: v.HeadRoot,
-			BeaconBlockSlot: slot.Slot,
-			SourceEpoch:     v.SourceSlot, // epoch == slot in lean
-			SourceRoot:      v.SourceRoot,
-			TargetEpoch:     v.TargetSlot,
-			TargetRoot:      v.TargetRoot,
-		})
+		if v.ValidatorIndex+1 > vc {
+			vc = v.ValidatorIndex + 1
+		}
+	}
+	committee := make([]uint64, 0, vc)
+	for i := uint64(0); i < vc; i++ {
+		committee = append(committee, i)
+	}
+	bitlen := (int(vc) + 7) / 8
+
+	type dataKey struct {
+		head                   string
+		sourceSlot, targetSlot uint64
+		sourceRoot, targetRoot string
+	}
+	groups := map[dataKey]*SlotPageAttestation{}
+	order := make([]dataKey, 0, len(votes))
+	for _, v := range votes {
+		k := dataKey{string(v.HeadRoot), v.SourceSlot, v.TargetSlot, string(v.SourceRoot), string(v.TargetRoot)}
+		att, ok := groups[k]
+		if !ok {
+			att = &SlotPageAttestation{
+				Slot:            v.Slot,
+				CommitteeIndex:  []uint64{0},
+				TotalActive:     vc,
+				AggregationBits: make([]byte, bitlen),
+				Validators:      committee,
+				Signature:       nil,
+				BeaconBlockRoot: v.HeadRoot,
+				BeaconBlockSlot: slot.Slot,
+				SourceEpoch:     v.SourceSlot, // epoch == slot in lean
+				SourceRoot:      v.SourceRoot,
+				TargetEpoch:     v.TargetSlot,
+				TargetRoot:      v.TargetRoot,
+			}
+			groups[k] = att
+			order = append(order, k)
+		}
+		// Bit position == validator index (no committee shuffling in lean).
+		att.AggregationBits[v.ValidatorIndex/8] |= 1 << (v.ValidatorIndex % 8)
+	}
+
+	atts := make([]*SlotPageAttestation, 0, len(order))
+	for _, k := range order {
+		atts = append(atts, groups[k])
 	}
 	return atts
 }
