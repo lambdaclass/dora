@@ -363,6 +363,90 @@ func TestCacheDrivenIngestion(t *testing.T) {
 	}
 }
 
+// TestBackfillParentBlocksHealsGap reproduces the frozen-head bug: a block
+// event delivers a tip whose parent chain is NOT yet cached (a missed/out-of-
+// order earlier event, or the backfill/live-stream seam). Without parent
+// backfill, computeSubtreeWeights stops at the first missing parent and the
+// canonical head freezes mid-chain. The fix walks UP and fetches the missing
+// ancestors so the cache is contiguous from the finalized anchor to the tip,
+// and computeCanonicalChain reaches the tip.
+func TestBackfillParentBlocksHealsGap(t *testing.T) {
+	initTestDB(t)
+
+	genesisRoot := rootOf(0x00) // anchor at slot 0
+	rA := rootOf(0x10)          // slot 1
+	rB := rootOf(0x20)          // slot 2
+	rC := rootOf(0x30)          // slot 3 (the tip that arrives first)
+
+	// A -> B -> C linear chain. The tip C carries the only vote (head = C), so a
+	// contiguous cache must put the head at C; a gap freezes it lower.
+	blkA := &leanapi.Block{Slot: 1, ProposerIndex: 1, ParentRoot: genesisRoot, StateRoot: rootOf(0xa0)}
+	blkB := &leanapi.Block{Slot: 2, ProposerIndex: 2, ParentRoot: rA, StateRoot: rootOf(0xb0)}
+	blkC := &leanapi.Block{Slot: 3, ProposerIndex: 3, ParentRoot: rB, StateRoot: rootOf(0xc0),
+		Body: attBody(3, rC, 0, 1, 2)}
+
+	mc := &mockClient{
+		genesis: &leanapi.Genesis{GenesisTime: 1000, ValidatorCount: 8},
+		spec:    &leanapi.Spec{MillisecondsPerSlot: 4000, IntervalsPerSlot: 5, MillisecondsPerInterval: 800},
+		// All blocks are fetchable by root, but only the tip arrives via an event;
+		// the parents must be pulled in by backfillParentBlocks.
+		blocks: map[string]*leanapi.Block{
+			rA.String(): blkA, rB.String(): blkB, rC.String(): blkC,
+		},
+		forkChoice: &leanapi.ForkChoice{Head: rC, Finalized: leanapi.Checkpoint{Root: genesisRoot, Slot: 0}},
+		justified:  &leanapi.JustifiedCheckpoint{Root: genesisRoot, Slot: 0},
+	}
+
+	ctx := context.Background()
+	idx := NewIndexer(ctx, logrus.New().WithField("test", true), mc)
+
+	// Seed the finalized anchor (genesis, slot 0) only. Parents A and B are NOT
+	// cached; the only events the indexer will see is the tip C.
+	idx.spec = leanapi.NewChainSpec(mc.genesis, mc.spec)
+	gen, _ := idx.blockCache.createOrGetBlock(genesisRoot, 0)
+	gen.SetBlock(&leanapi.Block{Slot: 0, ParentRoot: leanapi.Root{}, StateRoot: rootOf(0x99)})
+	gen.setForkId(idx.forkCache.getFinalizedForkId())
+	gen.setForkChecked()
+	idx.blockCache.addBlockToParentMap(gen)
+
+	// Sanity: only the anchor is cached before the event.
+	if got := idx.blockCache.size(); got != 1 {
+		t.Fatalf("precondition: expected only anchor cached, got %d blocks", got)
+	}
+
+	// The tip C arrives with NO pre-cached parents.
+	idx.onBlockEvent(&leanapi.BlockEventData{Slot: 3, Root: rC})
+
+	// Parent backfill must have pulled in A and B so the chain is contiguous:
+	// anchor + A + B + C = 4 blocks, every parent edge resolvable in-cache.
+	for _, r := range []leanapi.Root{rA, rB, rC} {
+		blk := idx.blockCache.getBlockByRoot(r)
+		if blk == nil {
+			t.Fatalf("expected %v backfilled into cache, missing", r.String())
+		}
+		if pr := blk.GetParentRoot(); idx.blockCache.getBlockByRoot(pr) == nil {
+			t.Fatalf("gap remains: parent %v of %v not cached", pr.String(), r.String())
+		}
+	}
+
+	// With a contiguous chain the canonical head reaches the tip C (vote weight
+	// propagates from C down to the anchor). A residual gap would freeze it lower.
+	head, _, _ := idx.computeCanonicalChain()
+	if head != rC {
+		t.Fatalf("computed head = %v, want tip C (%v); chain not contiguous", head.String(), rC.String())
+	}
+
+	// And the canonical set spans A -> C, proving no mid-chain hole. (The genesis
+	// anchor here is the zero root, where canonicalSet's walk terminates, so it
+	// is not itself a member; A's presence shows the walk reached the anchor.)
+	canon := idx.canonicalSet(rC)
+	for _, r := range []leanapi.Root{rA, rB, rC} {
+		if !canon[r] {
+			t.Fatalf("canonical set missing %v: %v", r.String(), canon)
+		}
+	}
+}
+
 func TestSetBitsDropsSentinel(t *testing.T) {
 	// 0,2,3 set with sentinel at bit 8.
 	got := setBits(bitlistWith(0, 2, 3))

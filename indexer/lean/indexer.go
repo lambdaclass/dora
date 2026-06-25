@@ -287,6 +287,79 @@ func (idx *Indexer) ingestCacheBlock(b *lean.Block, root lean.Root, recvDelay in
 	return block
 }
 
+// maxParentBackfill caps how many missing ancestors a single backfillParentBlocks
+// call will fetch, bounding the work (and network calls) triggered by one event.
+// A healthy chain only ever needs a handful of hops; hitting the cap signals a
+// large gap (e.g. a long stream outage) that the next events will continue to
+// heal.
+const maxParentBackfill = 256
+
+// backfillParentBlocks walks UP the parent chain of a freshly ingested cache
+// block, fetching and ingesting any ancestor that is missing from the cache, so
+// the cached chain is contiguous from the finalized anchor to this block before
+// canonical selection runs.
+//
+// It is iterative (never recurses through ingestCacheBlock) and fetches each
+// parent OUTSIDE any cache lock (GetBlockByID is a plain network call; the cache
+// mutations happen inside ingestCacheBlock's own locked helpers). It stops when:
+//   - the parent is already cached (the chain is contiguous from here down),
+//   - parentRoot is zero or self-referential (reached the genesis/anchor),
+//   - the parent's slot is below the finalized slot (it belongs to the DB
+//     finalized tier, not the unfinalized cache),
+//   - the fetch fails or returns nothing (log and stop; the gap heals on a later
+//     event), or
+//   - the iteration cap is hit (log and stop).
+func (idx *Indexer) backfillParentBlocks(block *Block) {
+	if block == nil {
+		return
+	}
+
+	finalizedSlot, _ := idx.finalizedCheckpoint()
+	parentRoot := block.GetParentRoot()
+
+	for i := 0; i < maxParentBackfill; i++ {
+		// Reached the anchor: no parent edge to follow.
+		if parentRoot.IsZero() || parentRoot == block.Root {
+			return
+		}
+		// Parent already cached: the chain is contiguous from here down.
+		if idx.blockCache.getBlockByRoot(parentRoot) != nil {
+			return
+		}
+
+		// Fetch the missing parent (outside any cache lock).
+		parent, err := idx.client.GetBlockByID(idx.ctx, parentRoot.String())
+		if err != nil || parent == nil {
+			idx.logger.WithFields(logrus.Fields{
+				"parent_root": parentRoot.String(),
+				"child_slot":  uint64(block.Slot),
+			}).Debug("parent backfill stopped: parent block unavailable (gap will heal on a later event)")
+			return
+		}
+
+		// Below the finalized horizon: belongs to the DB finalized tier, not the
+		// unfinalized cache. Stop before caching it.
+		if parent.Slot < finalizedSlot {
+			return
+		}
+
+		parentBlock := idx.ingestCacheBlock(parent, parentRoot, 0)
+		idx.logger.WithFields(logrus.Fields{
+			"parent_root": parentRoot.String(),
+			"parent_slot": uint64(parent.Slot),
+		}).Debug("backfilled missing parent block")
+
+		// Continue UP from the just-cached parent.
+		block = parentBlock
+		parentRoot = parentBlock.GetParentRoot()
+	}
+
+	idx.logger.WithFields(logrus.Fields{
+		"stopped_at": parentRoot.String(),
+		"cap":        maxParentBackfill,
+	}).Warn("parent backfill hit iteration cap; remaining gap will heal on later events")
+}
+
 // streamLoop subscribes to the SSE stream and reconnects (with a backfill of
 // the gap) on any drop, until ctx is cancelled.
 func (idx *Indexer) streamLoop() {
@@ -357,6 +430,15 @@ func (idx *Indexer) onBlockEvent(d *lean.BlockEventData) {
 	}
 	recvDelay := idx.recvDelayMs(uint64(block.Slot))
 	cacheBlock := idx.ingestCacheBlock(block, d.Root, recvDelay)
+
+	// Heal any gap in the cached parent chain before computing canonical: an SSE
+	// `block` event can arrive after a missed/out-of-order earlier event or
+	// across the backfill/live-stream seam, leaving this block's parent (and its
+	// ancestors) absent from the cache. Without this, computeSubtreeWeights stops
+	// propagating vote weight at the first missing parent and the canonical head
+	// freezes at the last contiguous-from-anchor block. Fetch+ingest the missing
+	// ancestors up to the finalized horizon so the chain is contiguous.
+	idx.backfillParentBlocks(cacheBlock)
 
 	// Cache the raw block blob for reorg replay (unfinalized tier).
 	if blob, err := json.Marshal(block); err == nil {
