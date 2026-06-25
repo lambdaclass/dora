@@ -92,9 +92,9 @@ func leanMainMenu() []mainMenuItem {
 			Label: "Blockchain",
 			Groups: []navigationGroup{{
 				Links: []navigationLink{
+					{Label: "Epochs", Path: "/epochs", Icon: "fa-history"},
 					{Label: "Slots", Path: "/slots", Icon: "fa-cube"},
 					{Label: "Finality", Path: "/finality", Icon: "fa-check-double"},
-					{Label: "Fork Choice", Path: "/forkchoice", Icon: "fa-code-branch"},
 				},
 			}},
 		},
@@ -107,10 +107,13 @@ func leanMainMenu() []mainMenuItem {
 			}},
 		},
 		{
-			Label: "Clients",
+			Label: "Network",
 			Groups: []navigationGroup{{
 				Links: []navigationLink{
-					{Label: "Fork Choice", Path: "/forkchoice", Icon: "fa-server"},
+					{Label: "Clients", Path: "/clients", Icon: "fa-server"},
+					{Label: "Forks", Path: "/forks", Icon: "fa-code-fork"},
+					{Label: "Chain Forks", Path: "/chain_forks", Icon: "fa-project-diagram"},
+					{Label: "Fork Choice", Path: "/forkchoice", Icon: "fa-code-branch"},
 				},
 			}},
 		},
@@ -227,6 +230,73 @@ func newRenderer() (*renderer, error) {
 		"_svg/timeline.html",
 		"_svg/professor.html",
 		"validators/validators.html",
+	); err != nil {
+		return nil, err
+	}
+
+	// --- Consensus clients on Dora's REAL chrome + REAL template. ---
+	// clients_cl.html references no eth-only sub-templates (its js/css are
+	// self-contained define blocks), so no stub file is needed.
+	if err := r.registerDora(funcs, layoutSrc, "clients",
+		"_layout/header.html",
+		"_layout/footer.html",
+		"_svg/timeline.html",
+		"clients/clients_cl.html",
+	); err != nil {
+		return nil, err
+	}
+
+	// --- Forks on Dora's REAL chrome + REAL template. ---
+	// forks.html carries its own inline "fork_client_cols" sub-template and
+	// self-contained js/css, so no stub file is needed.
+	if err := r.registerDora(funcs, layoutSrc, "forks",
+		"_layout/header.html",
+		"_layout/footer.html",
+		"_svg/timeline.html",
+		"forks/forks.html",
+	); err != nil {
+		return nil, err
+	}
+	// chain_forks.html is the cytoscape-graph page. It reads only .ChainSpecs;
+	// the diagram itself is drawn by static/js/chain-forks-diagram.js which
+	// AJAX-fetches a Dora epoch/slot data endpoint that lean does not serve, so
+	// the diagram area stays empty. We render the real page shell for chrome
+	// parity.
+	if err := r.registerDora(funcs, layoutSrc, "chain_forks",
+		"_layout/header.html",
+		"_layout/footer.html",
+		"_svg/timeline.html",
+		"chain_forks/chain_forks.html",
+	); err != nil {
+		return nil, err
+	}
+
+	// --- Epochs list + epoch detail on Dora's REAL chrome + REAL templates. ---
+	// Lean has no epochs: these render with real chrome but an empty/zeroed body.
+	// epochs.html uses _svg/professor.html for its empty-state graphic.
+	if err := r.registerDora(funcs, layoutSrc, "epochs",
+		"_layout/header.html",
+		"_layout/footer.html",
+		"_svg/timeline.html",
+		"_svg/professor.html",
+		"epochs/epochs.html",
+	); err != nil {
+		return nil, err
+	}
+	if err := r.registerDora(funcs, layoutSrc, "epoch",
+		"_layout/header.html",
+		"_layout/footer.html",
+		"_svg/timeline.html",
+		"epoch/epoch.html",
+	); err != nil {
+		return nil, err
+	}
+	// The epoch "not found" page redefines page/js/css, so register it on its own.
+	if err := r.registerDora(funcs, layoutSrc, "epochnotfound",
+		"_layout/header.html",
+		"_layout/footer.html",
+		"_svg/timeline.html",
+		"epoch/notfound.html",
 	); err != nil {
 		return nil, err
 	}

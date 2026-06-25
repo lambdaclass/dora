@@ -101,6 +101,34 @@ func TestRenderPages(t *testing.T) {
 			UrlParams:        []urlParam{{Key: "c", Value: "2"}},
 		}, "Validators"},
 		{"forkchoice", "/forkchoice", struct{ NodeUIURL string }{NodeUIURL: "http://node/ui"}, "Fork Choice"},
+		{"clients", "/clients", &ClientsCLPageData{
+			Clients: []*ClientsCLPageDataClient{
+				{Index: 0, Name: "ethlambda", Version: "ethlambda/v0.1.0", HeadSlot: 42, HeadRoot: []byte{0xde, 0xad}, Status: "online", PeerID: "ethlambda"},
+			},
+			ClientCount:      1,
+			Nodes:            map[string]*clientsCLNode{},
+			ShowPeerDASInfos: false,
+			Sorting:          "index",
+			IsDefaultSorting: true,
+		}, "Consensus clients"},
+		{"forks", "/forks", &ForksPageData{
+			Forks: []*ForksPageDataFork{
+				{HeadSlot: 42, HeadRoot: []byte{0xde, 0xad}, ClientCount: 1, Clients: []*ForksPageDataClient{
+					{Index: 0, Name: "ethlambda", Version: "ethlambda/v0.1.0", Status: "online", HeadSlot: 42, Distance: 0},
+				}},
+			},
+			ForkCount: 1,
+		}, "Forks"},
+		{"chain_forks", "/chain_forks", &ChainForksPageData{
+			ChainSpecs: &ChainSpecs{SlotsPerEpoch: 1, SlotDurationMs: 4000, CurrentSlot: 42, EpochsFor12h: 10800},
+		}, "Chain Forks"},
+		{"epochs", "/epochs", &EpochsPageData{
+			Epochs: nil, EpochCount: 0, IsDefaultPage: true, TotalPages: 1, PageSize: 25,
+		}, "Epochs"},
+		{"epoch", "/epoch/", &EpochPageData{
+			Epoch: 1, PreviousEpoch: 0, NextEpoch: 0, Synchronized: false,
+		}, "Epoch"},
+		{"epochnotfound", "/epoch/", struct{}{}, "Epoch"},
 	}
 
 	for _, c := range cases {
