@@ -2,9 +2,11 @@ package webui
 
 import (
 	"context"
+	"encoding/hex"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ethpandaops/dora/db"
 	"github.com/ethpandaops/dora/dbtypes"
@@ -12,30 +14,111 @@ import (
 
 const slotsPerPage = 50
 
+// dashboardRows is how many recent slots/blocks the homepage panels show.
+const dashboardRows = 10
+
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := s.reqCtx(r)
 	defer cancel()
 
 	head, justified, finalized := s.indexer.HeadState()
-	slots, _ := db.GetSlotsByRange(ctx, sub(head, slotsPerPage), head, slotsPerPage)
 	vc := s.validatorCount(ctx)
+	slots, _ := db.GetSlotsByRange(ctx, sub(head, dashboardRows-1), head, dashboardRows)
 
-	data := struct {
-		HeadSlot       uint64
-		JustifiedSlot  uint64
-		FinalizedSlot  uint64
-		ValidatorCount uint64
-		SlotSeconds    uint64
-		Slots          []*dbtypes.Slot
-	}{
-		HeadSlot:       head,
-		JustifiedSlot:  justified,
-		FinalizedSlot:  finalized,
-		ValidatorCount: vc,
-		SlotSeconds:    s.slotSeconds(),
-		Slots:          slots,
+	data := &IndexPageData{
+		// Lean has no epochs: map slot 1:1 onto the epoch chrome so the
+		// "Epoch" / "Current Slot" fields both read the head slot.
+		CurrentEpoch:          head,
+		CurrentSlot:           head,
+		CurrentFinalizedEpoch: int64(finalized),
+		CurrentJustifiedEpoch: int64(justified),
+		CurrentScheduledCount: 0,   // no scheduling view in lean
+		CurrentEpochProgress:  100, // epoch == slot, always "complete"
+
+		SlotsPerEpoch:   1, // lean: 1 slot per "epoch"
+		SlotDurationMs:  s.slotSeconds() * 1000,
+		EpochDurationMs: s.slotSeconds() * 1000,
+
+		// Validator economics do not exist in lean: report count only, zero the rest.
+		ActiveValidatorCount:    vc,
+		EnteringValidatorCount:  0,
+		ExitingValidatorCount:   0,
+		TotalEligibleEther:      0,
+		AverageValidatorBalance: 0,
+
+		NetworkName:           s.networkName(),
+		GenesisTime:           s.genesisTime(),
+		GenesisValidatorsRoot: nil,
+
+		NetworkForks:  s.networkForks(),
+		ForkTreeWidth: 0,
+
+		// Lean has no epochs: leave the recent-epochs panel empty (renders greyed).
+		RecentEpochs:     nil,
+		RecentEpochCount: 0,
+
+		RecentSlots:      s.toIndexSlots(slots),
+		RecentSlotCount:  uint64(len(slots)),
+		RecentBlocks:     s.toIndexBlocks(slots),
+		RecentBlockCount: uint64(len(slots)),
 	}
 	s.renderer.render(w, "dashboard", "lean-dora · Dashboard", "/", data)
+}
+
+// toIndexSlots maps canonical-ordered db slots to the homepage recent-slots
+// rows. The fork graph is a single straight column (lean shows no competing
+// forks here).
+func (s *Server) toIndexSlots(slots []*dbtypes.Slot) []*IndexPageDataSlots {
+	out := make([]*IndexPageDataSlots, 0, len(slots))
+	for _, sl := range slots {
+		out = append(out, &IndexPageDataSlots{
+			Epoch:      sl.Slot, // epoch == slot in lean
+			Slot:       sl.Slot,
+			Ts:         s.slotTime(sl.Slot),
+			Proposer:   sl.Proposer,
+			Status:     uint64(sl.Status),
+			BlockRoot:  sl.Root,
+			ParentRoot: sl.ParentRoot,
+			ForkGraph:  nil,
+		})
+	}
+	return out
+}
+
+// toIndexBlocks maps the same canonical slots to recent-block rows. WithEthBlock
+// is always false (no execution layer) so the eth-block column renders "-".
+func (s *Server) toIndexBlocks(slots []*dbtypes.Slot) []*IndexPageDataBlocks {
+	out := make([]*IndexPageDataBlocks, 0, len(slots))
+	for _, sl := range slots {
+		out = append(out, &IndexPageDataBlocks{
+			Epoch:        sl.Slot,
+			Slot:         sl.Slot,
+			WithEthBlock: false,
+			Ts:           s.slotTime(sl.Slot),
+			Proposer:     sl.Proposer,
+			Status:       uint64(sl.Status),
+			BlockRoot:    sl.Root,
+		})
+	}
+	return out
+}
+
+// networkForks returns the single lean fork derived from the chain spec's fork
+// digest, always active. This replaces Dora's eth fork ladder.
+func (s *Server) networkForks() []*IndexPageDataForks {
+	fork := &IndexPageDataForks{
+		Name:   "lean",
+		Epoch:  0,
+		Active: true,
+		Type:   "consensus",
+	}
+	if s.spec != nil {
+		fork.Time = s.spec.GenesisTime
+		if b, err := hex.DecodeString(strings.TrimPrefix(s.spec.ForkDigest, "0x")); err == nil {
+			fork.ForkDigest = b
+		}
+	}
+	return []*IndexPageDataForks{fork}
 }
 
 func (s *Server) handleSlots(w http.ResponseWriter, r *http.Request) {
@@ -186,4 +269,29 @@ func (s *Server) slotSeconds() uint64 {
 		return s.spec.MillisecondsPerSlot / 1000
 	}
 	return 4
+}
+
+// slotTime returns the wall-clock time for a slot from the chain spec, falling
+// back to genesis + slot*slotSeconds when SlotToTime is unavailable.
+func (s *Server) slotTime(slot uint64) time.Time {
+	if s.spec != nil {
+		return s.spec.SlotToTime(slot)
+	}
+	return time.Unix(int64(slot*s.slotSeconds()), 0).UTC()
+}
+
+// genesisTime returns the chain genesis time, or the zero time if unknown.
+func (s *Server) genesisTime() time.Time {
+	if s.spec != nil {
+		return s.spec.GenesisTimestamp()
+	}
+	return time.Time{}
+}
+
+// networkName derives a display name for the lean network from the fork digest.
+func (s *Server) networkName() string {
+	if s.spec != nil && s.spec.ForkDigest != "" {
+		return "lean-" + strings.TrimPrefix(s.spec.ForkDigest, "0x")
+	}
+	return "lean"
 }

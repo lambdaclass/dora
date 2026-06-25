@@ -9,6 +9,7 @@ import (
 	"time"
 
 	doratemplates "github.com/ethpandaops/dora/templates"
+	"github.com/ethpandaops/dora/utils"
 )
 
 // leanTemplates holds the lean page templates plus the shared lean chrome
@@ -23,6 +24,9 @@ var leanTemplates embed.FS
 // We intentionally avoid time.Now() at template-parse time.
 var buildTime = time.Now().UTC().Format("20060102150405")
 
+// version is surfaced in the footer ("Powered by ... | {{ .Version }}").
+const version = "lean-dora"
+
 // pageMeta carries the per-page metadata the Dora layout expects.
 type pageMeta struct {
 	Title       string
@@ -31,24 +35,106 @@ type pageMeta struct {
 	Path        string
 }
 
-// pageRoot wraps a per-page data struct with the fields Dora's _layout template
-// (and our lean header/footer) read off the root.
+// pageRoot wraps a per-page data struct with the fields Dora's real layout,
+// header and footer templates read off the root (".") — not off .Data. The
+// header reads ExplorerLogo/Title/Subtitle, IsReady, MainMenuItems, ApiEnabled
+// and ExecutionIndexerEnabled; the footer reads Version. Populating these lets
+// Dora's real chrome execute with no nil-map/nil-pointer panics.
 type pageRoot struct {
 	BuildTime  string
 	ServerTime string
 	Meta       pageMeta
 	Data       any
+
+	// Header/footer fields (root-scoped).
+	Version                 string
+	ExplorerLogo            string
+	ExplorerTitle           string
+	ExplorerSubtitle        string
+	IsReady                 bool
+	ApiEnabled              bool
+	ExecutionIndexerEnabled bool
+	MainMenuItems           []mainMenuItem
 }
 
-// renderer compiles and caches the lean page templates. Each cache entry is the
-// Dora layout + lean chrome + one page template, executable as the "layout"
-// template against a pageRoot.
+// mainMenuItem / navigationGroup / navigationLink mirror Dora's navbar model
+// (types/models.MainMenuItem et al.) with the exact field names the real
+// header template reads.
+type mainMenuItem struct {
+	Label    string
+	Path     string
+	IsActive bool
+	Groups   []navigationGroup
+}
+
+type navigationGroup struct {
+	Label string
+	Links []navigationLink
+}
+
+type navigationLink struct {
+	Label         string
+	Path          string
+	CustomIcon    string
+	Icon          string
+	IsHidden      bool
+	IsHighlighted bool
+}
+
+// leanMainMenu returns the navbar layout for the lean explorer. It mirrors the
+// shape of Dora's eth navbar (Blockchain / Validators / Clients dropdowns) so
+// the chrome looks identical, but the links point at lean routes. active marks
+// the dropdown that contains the current page so it highlights.
+func leanMainMenu() []mainMenuItem {
+	return []mainMenuItem{
+		{
+			Label: "Blockchain",
+			Groups: []navigationGroup{{
+				Links: []navigationLink{
+					{Label: "Slots", Path: "/slots", Icon: "fa-cube"},
+					{Label: "Finality", Path: "/finality", Icon: "fa-check-double"},
+					{Label: "Fork Choice", Path: "/forkchoice", Icon: "fa-code-branch"},
+				},
+			}},
+		},
+		{
+			Label: "Validators",
+			Groups: []navigationGroup{{
+				Links: []navigationLink{
+					{Label: "Validators", Path: "/validators", Icon: "fa-users"},
+				},
+			}},
+		},
+		{
+			Label: "Clients",
+			Groups: []navigationGroup{{
+				Links: []navigationLink{
+					{Label: "Fork Choice", Path: "/forkchoice", Icon: "fa-server"},
+				},
+			}},
+		},
+	}
+}
+
+// renderer compiles and caches the explorer page templates. The homepage
+// ("dashboard") is assembled from Dora's real layout + header + footer + svg
+// chrome plus the real templates/index/*.html files, so it is pixel-identical
+// to Dora. The remaining lean pages keep the hand-rolled lean chrome
+// (_lean.html) for now; both are valid "layout" templates in separate cache
+// entries.
 type renderer struct {
 	cache map[string]*template.Template
 }
 
 func newRenderer() (*renderer, error) {
 	r := &renderer{cache: make(map[string]*template.Template)}
+
+	// Funcs: start from Dora's full helper set (every helper the index templates
+	// call) and merge in the small lean-only helpers used by the lean pages.
+	funcs := utils.GetTemplateFuncs()
+	for name, fn := range funcMap {
+		funcs[name] = fn
+	}
 
 	// Reuse Dora's real layout chrome from the templates package embed.
 	layoutSrc, err := fs.ReadFile(doratemplates.Files, "_layout/layout.html")
@@ -60,23 +146,34 @@ func newRenderer() (*renderer, error) {
 		return nil, fmt.Errorf("read lean chrome: %w", err)
 	}
 
-	pages := map[string]string{
-		"dashboard":  "templates/lean/dashboard.html",
+	// --- Homepage on Dora's REAL chrome + REAL index templates. ---
+	if err := r.registerDora(funcs, layoutSrc, "dashboard",
+		"_layout/header.html",
+		"_layout/footer.html",
+		"_svg/timeline.html",
+		"index/index.html",
+		"index/networkOverview.html",
+		"index/recentEpochs.html",
+		"index/recentBlocks.html",
+		"index/recentSlots.html",
+	); err != nil {
+		return nil, err
+	}
+
+	// --- Remaining lean pages on the hand-rolled lean chrome. ---
+	leanPages := map[string]string{
 		"slots":      "templates/lean/slots.html",
 		"slot":       "templates/lean/slot.html",
 		"finality":   "templates/lean/finality.html",
 		"validators": "templates/lean/validators.html",
 		"forkchoice": "templates/lean/forkchoice.html",
 	}
-
-	for name, path := range pages {
+	for name, path := range leanPages {
 		pageSrc, err := leanTemplates.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("read page %s: %w", name, err)
 		}
-		t := template.New(name).Funcs(funcMap)
-		// Order matters only in that all needed defines must be present; the page
-		// "page"/"css"/"js" defines come from pageSrc, chrome supplies the rest.
+		t := template.New(name).Funcs(funcs)
 		if _, err := t.Parse(string(layoutSrc)); err != nil {
 			return nil, fmt.Errorf("parse layout for %s: %w", name, err)
 		}
@@ -89,6 +186,26 @@ func newRenderer() (*renderer, error) {
 		r.cache[name] = t
 	}
 	return r, nil
+}
+
+// registerDora parses Dora's real layout plus the given Dora template files
+// (paths relative to the templates package embed) into one cache entry.
+func (r *renderer) registerDora(funcs template.FuncMap, layoutSrc []byte, name string, files ...string) error {
+	t := template.New(name).Funcs(funcs)
+	if _, err := t.Parse(string(layoutSrc)); err != nil {
+		return fmt.Errorf("parse layout for %s: %w", name, err)
+	}
+	for _, f := range files {
+		src, err := fs.ReadFile(doratemplates.Files, f)
+		if err != nil {
+			return fmt.Errorf("read dora template %s: %w", f, err)
+		}
+		if _, err := t.Parse(string(src)); err != nil {
+			return fmt.Errorf("parse dora template %s for %s: %w", f, name, err)
+		}
+	}
+	r.cache[name] = t
+	return nil
 }
 
 // render executes the named page template, wrapping data in a pageRoot.
@@ -108,6 +225,21 @@ func (r *renderer) render(w http.ResponseWriter, name, title, path string, data 
 			Path:        path,
 		},
 		Data: data,
+
+		Version:       version,
+		ExplorerTitle: "lean-dora",
+		IsReady:       true,
+		MainMenuItems: leanMainMenu(),
+	}
+	// Mark the active nav dropdown by path prefix.
+	for i := range root.MainMenuItems {
+		for _, g := range root.MainMenuItems[i].Groups {
+			for _, l := range g.Links {
+				if l.Path == path {
+					root.MainMenuItems[i].IsActive = true
+				}
+			}
+		}
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := t.ExecuteTemplate(w, "layout", root); err != nil {

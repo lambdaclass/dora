@@ -23,10 +23,24 @@ func TestRenderPages(t *testing.T) {
 		data  any
 		title string
 	}{
-		{"dashboard", "/", struct {
-			HeadSlot, JustifiedSlot, FinalizedSlot, ValidatorCount, SlotSeconds uint64
-			Slots                                                               []*dbtypes.Slot
-		}{Slots: []*dbtypes.Slot{{Slot: 1, Status: dbtypes.Canonical, Root: []byte{1, 2, 3, 4}}}}, "Dashboard"},
+		{"dashboard", "/", &IndexPageData{
+			CurrentEpoch:         1,
+			CurrentSlot:          1,
+			SlotsPerEpoch:        1,
+			CurrentEpochProgress: 100,
+			NetworkName:          "lean-test",
+			NetworkForks: []*IndexPageDataForks{
+				{Name: "lean", Active: true, Type: "consensus", ForkDigest: []byte{0x12, 0x34, 0x56, 0x78}},
+			},
+			RecentSlots: []*IndexPageDataSlots{
+				{Epoch: 1, Slot: 1, Status: 1, BlockRoot: []byte{1, 2, 3, 4}},
+			},
+			RecentSlotCount: 1,
+			RecentBlocks: []*IndexPageDataBlocks{
+				{Epoch: 1, Slot: 1, Status: 1, BlockRoot: []byte{1, 2, 3, 4}},
+			},
+			RecentBlockCount: 1,
+		}, "Dashboard"},
 		{"slots", "/slots", struct {
 			MinSlot, MaxSlot   uint64
 			Slots              []*dbtypes.Slot
