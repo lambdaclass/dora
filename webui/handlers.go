@@ -21,7 +21,6 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	vc := s.validatorCount(ctx)
 
 	data := struct {
-		Title          string
 		HeadSlot       uint64
 		JustifiedSlot  uint64
 		FinalizedSlot  uint64
@@ -29,7 +28,6 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		SlotSeconds    uint64
 		Slots          []*dbtypes.Slot
 	}{
-		Title:          "Dashboard",
 		HeadSlot:       head,
 		JustifiedSlot:  justified,
 		FinalizedSlot:  finalized,
@@ -37,8 +35,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		SlotSeconds:    s.slotSeconds(),
 		Slots:          slots,
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	tmplDashboard.Execute(w, data)
+	s.renderer.render(w, "dashboard", "lean-dora · Dashboard", "/", data)
 }
 
 func (s *Server) handleSlots(w http.ResponseWriter, r *http.Request) {
@@ -56,7 +53,6 @@ func (s *Server) handleSlots(w http.ResponseWriter, r *http.Request) {
 	slots, _ := db.GetSlotsByRange(ctx, minSlot, maxSlot, slotsPerPage)
 
 	data := struct {
-		Title    string
 		MinSlot  uint64
 		MaxSlot  uint64
 		Slots    []*dbtypes.Slot
@@ -65,7 +61,6 @@ func (s *Server) handleSlots(w http.ResponseWriter, r *http.Request) {
 		NewerMax uint64
 		OlderMax uint64
 	}{
-		Title:    "Slots",
 		MinSlot:  minSlot,
 		MaxSlot:  maxSlot,
 		Slots:    slots,
@@ -74,8 +69,7 @@ func (s *Server) handleSlots(w http.ResponseWriter, r *http.Request) {
 		NewerMax: minVal(head, maxSlot+slotsPerPage),
 		OlderMax: sub(minSlot, 1),
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	tmplSlots.Execute(w, data)
+	s.renderer.render(w, "slots", "lean-dora · Slots", "/slots", data)
 }
 
 func (s *Server) handleSlotDetail(w http.ResponseWriter, r *http.Request) {
@@ -107,18 +101,15 @@ func (s *Server) handleSlotDetail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := struct {
-		Title     string
 		Slot      *dbtypes.Slot
 		Votes     []*dbtypes.Vote
 		VoteCount int
 	}{
-		Title:     "Slot",
 		Slot:      slot,
 		Votes:     votes,
 		VoteCount: len(votes),
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	tmplSlotDetail.Execute(w, data)
+	s.renderer.render(w, "slot", "lean-dora · Slot", "/slot/", data)
 }
 
 func (s *Server) handleFinality(w http.ResponseWriter, r *http.Request) {
@@ -130,20 +121,17 @@ func (s *Server) handleFinality(w http.ResponseWriter, r *http.Request) {
 	jcps, _ := db.GetCheckpoints(ctx, dbtypes.CheckpointJustified, 50)
 
 	data := struct {
-		Title         string
 		JustifiedSlot uint64
 		FinalizedSlot uint64
 		Finalized     []*dbtypes.Checkpoint
 		Justified     []*dbtypes.Checkpoint
 	}{
-		Title:         "Finality",
 		JustifiedSlot: justified,
 		FinalizedSlot: finalized,
 		Finalized:     fcps,
 		Justified:     jcps,
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	tmplFinality.Execute(w, data)
+	s.renderer.render(w, "finality", "lean-dora · Finality", "/finality", data)
 }
 
 func (s *Server) handleValidators(w http.ResponseWriter, r *http.Request) {
@@ -152,28 +140,22 @@ func (s *Server) handleValidators(w http.ResponseWriter, r *http.Request) {
 
 	validators, _ := db.GetValidators(ctx)
 	data := struct {
-		Title          string
 		ValidatorCount uint64
 		Validators     []*dbtypes.Validator
 	}{
-		Title:          "Validators",
 		ValidatorCount: s.validatorCount(ctx),
 		Validators:     validators,
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	tmplValidators.Execute(w, data)
+	s.renderer.render(w, "validators", "lean-dora · Validators", "/validators", data)
 }
 
 func (s *Server) handleForkChoice(w http.ResponseWriter, r *http.Request) {
 	data := struct {
-		Title     string
 		NodeUIURL string
 	}{
-		Title:     "Fork Choice",
 		NodeUIURL: strings.TrimRight(s.nodeEndpoint, "/") + "/lean/v0/fork_choice/ui",
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	tmplForkChoice.Execute(w, data)
+	s.renderer.render(w, "forkchoice", "lean-dora · Fork Choice", "/forkchoice", data)
 }
 
 // handleForkChoiceJSON proxies the node's fork-choice tree as JSON for any UI
