@@ -1,17 +1,50 @@
 {{ define "networkOverview" }}
   <div style="position:relative" class="card mt-3 index-stats">
-    <div style="position:absolute; border-bottom-left-radius: 0; border-bottom-right-radius: 0; font-size:.70rem; height:.8rem;" class="progress w-100" data-placement="bottom" title="This epoch is {{ formatFloat .CurrentEpochProgress 0 }}% complete" data-bind="attr: {title: 'This epoch is ' + $root.formatFloat(cur_epoch_prog(), 0) + '% complete'}">
-      <div style="width:{{ formatFloat .CurrentEpochProgress 0 }}%; padding: 0.3rem;" class="progress-bar bg-secondary" role="progressbar" :aria-valuenow="scheduledCount" aria-valuemin="0" aria-valuemax="32" data-bind="attr: {style: 'padding: 0.3rem;'}, style: {width: $root.formatFloat(cur_epoch_prog(), 0)+'%'}">
+    {{/*
+      Lean has 1 slot per "epoch", so Dora's epoch-progress bar is degenerate
+      (always 100%). Instead we animate progress through the CURRENT SLOT by
+      wall-clock: a thin strip that fills over each slot and resets. It is driven
+      entirely client-side (genesis + slot duration) rather than the 15s /index/data
+      poll, so it ticks smoothly. No knockout binding on this element.
+    */}}
+    <div id="slot-progress" style="position:absolute; border-bottom-left-radius: 0; border-bottom-right-radius: 0; font-size:.70rem; height:.8rem;" class="progress w-100" data-placement="bottom" title="Current slot progress">
+      <div id="slot-progress-bar" style="width:0%; padding: 0.3rem;" class="progress-bar bg-secondary" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+           data-genesis="{{ .GenesisTime.Unix }}" data-slot-ms="{{ .SlotDurationMs }}">
         {{- /**/ -}}
-        <span data-bind="text: cur_scheduled() > 0 ? cur_scheduled() + ' / ' + slots_per_epoch() + ' slots left in epoch ' + cur_epoch() : 'epoch ' + cur_epoch() + ' complete'">
-          {{ if gt .CurrentScheduledCount 0 -}}
-            {{ .CurrentScheduledCount }} / 32 slots left in epoch {{ .CurrentEpoch }}
-          {{- else -}}
-            epoch {{ .CurrentEpoch }} complete
-          {{- end }}
-        </span>
+        <span id="slot-progress-text">slot {{ .CurrentSlot }}</span>
       </div>
     </div>
+    <script type="text/javascript">
+      (function () {
+        var bar = document.getElementById("slot-progress-bar");
+        var text = document.getElementById("slot-progress-text");
+        var wrap = document.getElementById("slot-progress");
+        if (!bar) return;
+        var genesisMs = parseInt(bar.getAttribute("data-genesis"), 10) * 1000;
+        var slotMs = parseInt(bar.getAttribute("data-slot-ms"), 10) || 4000;
+        if (!genesisMs || genesisMs <= 0 || slotMs <= 0) return;
+        function tick() {
+          var now = Date.now();
+          if (now < genesisMs) {
+            bar.style.width = "0%";
+            if (text) text.textContent = "waiting for genesis";
+            return;
+          }
+          var sinceGenesis = now - genesisMs;
+          var slot = Math.floor(sinceGenesis / slotMs);
+          var elapsed = sinceGenesis % slotMs;
+          var pct = Math.min(100, (elapsed / slotMs) * 100);
+          bar.style.width = pct.toFixed(0) + "%";
+          if (text) {
+            text.textContent =
+              "slot " + slot + " · " + (elapsed / 1000).toFixed(1) + "s / " + (slotMs / 1000).toFixed(0) + "s";
+          }
+          if (wrap) wrap.setAttribute("title", "Slot " + slot + " is " + pct.toFixed(0) + "% elapsed");
+        }
+        tick();
+        setInterval(tick, 250);
+      })();
+    </script>
 
     <div class="card-header pt-3">
       <div class="row">
