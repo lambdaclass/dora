@@ -144,25 +144,45 @@ func parseSSE(ctx context.Context, r io.Reader, out chan<- StreamEvent) {
 	}
 }
 
+// eventEnvelope is ethlambda's SSE data wrapper: the `data:` line carries
+// {"event":"<type>","data":{...}} rather than the bare payload, so the typed
+// payload is nested one level under "data".
+type eventEnvelope struct {
+	Event string          `json:"event"`
+	Data  json.RawMessage `json:"data"`
+}
+
+// payloadBytes unwraps the ethlambda envelope, returning the inner "data"
+// object. If the frame is not wrapped (no "data" field), it falls back to the
+// raw bytes so a bare payload still decodes.
+func payloadBytes(data string) []byte {
+	var env eventEnvelope
+	if err := json.Unmarshal([]byte(data), &env); err == nil && len(env.Data) > 0 {
+		return env.Data
+	}
+	return []byte(data)
+}
+
 // decodeEvent parses one assembled SSE frame into a StreamEvent. Unknown event
 // types are ignored (returns nil).
 func decodeEvent(name StreamEventType, data string) *StreamEvent {
+	payload := payloadBytes(data)
 	switch name {
 	case StreamEventHead:
 		var d HeadEventData
-		if err := json.Unmarshal([]byte(data), &d); err != nil {
+		if err := json.Unmarshal(payload, &d); err != nil {
 			return &StreamEvent{Type: name, Err: err}
 		}
 		return &StreamEvent{Type: name, Head: &d}
 	case StreamEventBlock:
 		var d BlockEventData
-		if err := json.Unmarshal([]byte(data), &d); err != nil {
+		if err := json.Unmarshal(payload, &d); err != nil {
 			return &StreamEvent{Type: name, Err: err}
 		}
 		return &StreamEvent{Type: name, Block: &d}
 	case StreamEventFinalizedCheckpoint:
 		var d FinalizedCheckpointEventData
-		if err := json.Unmarshal([]byte(data), &d); err != nil {
+		if err := json.Unmarshal(payload, &d); err != nil {
 			return &StreamEvent{Type: name, Err: err}
 		}
 		return &StreamEvent{Type: name, Finalized: &d}
