@@ -358,12 +358,50 @@ func (s *Server) handleValidators(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	validators, _ := db.GetValidators(ctx)
-	data := struct {
-		ValidatorCount uint64
-		Validators     []*dbtypes.Validator
-	}{
-		ValidatorCount: s.validatorCount(ctx),
-		Validators:     validators,
+
+	// The lean validator registry is small and static (no activation queue, no
+	// exits, no balances), so we serve the whole set on a single page and ignore
+	// the filter/sort query params Dora's template exposes.
+	rows := make([]*ValidatorsPageDataValidator, 0, len(validators))
+	for _, v := range validators {
+		rows = append(rows, &ValidatorsPageDataValidator{
+			Index:     v.Index,
+			PublicKey: v.AttestationPubkey,
+			// Every registry member is permanently active in lean. No economics
+			// (Balance/EffectiveBalance stay 0 → "0 (0 ETH)"), no epochs
+			// (ShowActivation/ShowExit false → "-"), no withdrawal credentials
+			// (ShowWithdrawAddress false → "-"), no liveness up-check.
+			State: "Active",
+		})
+	}
+
+	count := uint64(len(rows))
+	data := &ValidatorsPageData{
+		Validators:     rows,
+		ValidatorCount: count,
+		FirstValidator: 0,
+		LastValidator:  count,
+
+		// A single inert "Active" status option; no credential-type filtering.
+		FilterStatusOpts: []ValidatorsPageDataStatusOption{{Status: "Active", Count: count}},
+		FilterCredTypes:  map[uint8]bool{},
+
+		Sorting:          "index",
+		IsDefaultSorting: true,
+		IsDefaultPage:    true,
+
+		// One page holds the whole registry, so pagination controls stay hidden
+		// (template gates them on TotalPages > 1).
+		TotalPages:       1,
+		PageSize:         count,
+		CurrentPageIndex: 1,
+		LastPageIndex:    1,
+
+		FilteredPageLink: "/validators?f&c=" + strconv.FormatUint(count, 10),
+		UrlParams: []urlParam{{
+			Key:   "c",
+			Value: strconv.FormatUint(count, 10),
+		}},
 	}
 	s.renderer.render(w, "validators", "lean-dora · Validators", "/validators", data)
 }

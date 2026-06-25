@@ -218,10 +218,22 @@ func newRenderer() (*renderer, error) {
 		return nil, err
 	}
 
+	// --- Validators list on Dora's REAL chrome + REAL template. ---
+	// validators.html uses _svg/professor.html for the empty-state graphic; it
+	// references no eth-only sub-templates, so no stub file is needed.
+	if err := r.registerDora(funcs, layoutSrc, "validators",
+		"_layout/header.html",
+		"_layout/footer.html",
+		"_svg/timeline.html",
+		"_svg/professor.html",
+		"validators/validators.html",
+	); err != nil {
+		return nil, err
+	}
+
 	// --- Remaining lean pages on the hand-rolled lean chrome. ---
 	leanPages := map[string]string{
 		"finality":   "templates/lean/finality.html",
-		"validators": "templates/lean/validators.html",
 		"forkchoice": "templates/lean/forkchoice.html",
 	}
 	for name, path := range leanPages {

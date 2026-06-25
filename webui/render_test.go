@@ -81,10 +81,25 @@ func TestRenderPages(t *testing.T) {
 			JustifiedSlot, FinalizedSlot uint64
 			Finalized, Justified         []*dbtypes.Checkpoint
 		}{}, "Finality"},
-		{"validators", "/validators", struct {
-			ValidatorCount uint64
-			Validators     []*dbtypes.Validator
-		}{}, "Validators"},
+		{"validators", "/validators", &ValidatorsPageData{
+			Validators: []*ValidatorsPageDataValidator{
+				{Index: 0, PublicKey: []byte{0xab, 0xcd}, State: "Active"},
+				{Index: 1, PublicKey: []byte{0xef, 0x01}, State: "Active"},
+			},
+			ValidatorCount:   2,
+			LastValidator:    2,
+			FilterStatusOpts: []ValidatorsPageDataStatusOption{{Status: "Active", Count: 2}},
+			FilterCredTypes:  map[uint8]bool{},
+			Sorting:          "index",
+			IsDefaultSorting: true,
+			IsDefaultPage:    true,
+			TotalPages:       1,
+			PageSize:         2,
+			CurrentPageIndex: 1,
+			LastPageIndex:    1,
+			FilteredPageLink: "/validators?f&c=2",
+			UrlParams:        []urlParam{{Key: "c", Value: "2"}},
+		}, "Validators"},
 		{"forkchoice", "/forkchoice", struct{ NodeUIURL string }{NodeUIURL: "http://node/ui"}, "Fork Choice"},
 	}
 
