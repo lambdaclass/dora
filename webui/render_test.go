@@ -41,22 +41,42 @@ func TestRenderPages(t *testing.T) {
 			},
 			RecentBlockCount: 1,
 		}, "Dashboard"},
-		{"slots", "/slots", struct {
-			MinSlot, MaxSlot   uint64
-			Slots              []*dbtypes.Slot
-			HasNewer, HasOlder bool
-			NewerMax, OlderMax uint64
-		}{Slots: []*dbtypes.Slot{{Slot: 2, Status: dbtypes.Orphaned}}}, "Slots"},
-		{"slot", "/slot/", struct {
-			Slot      *dbtypes.Slot
-			Votes     []*dbtypes.Vote
-			VoteCount int
-		}{Slot: &dbtypes.Slot{Slot: 3, Status: dbtypes.Canonical, Root: []byte{9, 9}}}, "Slot"},
-		{"slot-notfound", "/slot/", struct {
-			Slot      *dbtypes.Slot
-			Votes     []*dbtypes.Vote
-			VoteCount int
-		}{}, "Slot"},
+		{"slots", "/slots", &SlotsPageData{
+			Slots: []*SlotsPageDataSlot{
+				{Slot: 2, Epoch: 2, Status: uint8(dbtypes.Orphaned), Synchronized: true, BlockRoot: []byte{5, 6, 7, 8}},
+			},
+			SlotCount:           1,
+			DisplayEpoch:        true,
+			DisplaySlot:         true,
+			DisplayStatus:       true,
+			DisplayTime:         true,
+			DisplayProposer:     true,
+			DisplayAttestations: true,
+			DisplayColCount:     6,
+			IsDefaultPage:       true,
+			TotalPages:          1,
+			PageSize:            slotsPerPage,
+			FirstPageLink:       "/slots",
+		}, "Slots"},
+		{"slot", "/slot/", &SlotPageData{
+			Slot:   3,
+			Epoch:  3,
+			Status: uint16(dbtypes.Canonical),
+			Block: &SlotPageBlockData{
+				BlockRoot:            []byte{9, 9},
+				ParentRoot:           []byte{8, 8},
+				StateRoot:            []byte{7, 7},
+				AttestationsCount:    1,
+				SlotsPerEpoch:        1,
+				TargetCommitteeSize:  4,
+				MaxCommitteesPerSlot: 1,
+				Attestations: []*SlotPageAttestation{
+					{Slot: 3, CommitteeIndex: []uint64{0}, AggregationBits: []byte{0x01}, Validators: []uint64{0}, BeaconBlockSlot: 3},
+				},
+			},
+			SlotBlocks: []*SlotPageSlotBlock{{BlockRoot: []byte{9, 9}, Status: uint16(dbtypes.Canonical), IsCurrent: true}},
+		}, "Slot"},
+		{"slotnotfound", "/slot/", struct{}{}, "Slot"},
 		{"finality", "/finality", struct {
 			JustifiedSlot, FinalizedSlot uint64
 			Finalized, Justified         []*dbtypes.Checkpoint
@@ -70,13 +90,8 @@ func TestRenderPages(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			// Map the test case "name" to the actual page template name.
-			page := c.name
-			if page == "slot-notfound" {
-				page = "slot"
-			}
 			rec := &captureWriter{}
-			r.render(rec, page, "lean-dora · "+c.title, c.path, c.data)
+			r.render(rec, c.name, "lean-dora · "+c.title, c.path, c.data)
 			if rec.status != 0 && rec.status != 200 {
 				t.Fatalf("render %s wrote error status %d: %s", c.name, rec.status, rec.body.String())
 			}

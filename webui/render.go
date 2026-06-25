@@ -9,6 +9,7 @@ import (
 	"time"
 
 	doratemplates "github.com/ethpandaops/dora/templates"
+	"github.com/ethpandaops/dora/types"
 	"github.com/ethpandaops/dora/utils"
 )
 
@@ -127,6 +128,16 @@ type renderer struct {
 }
 
 func newRenderer() (*renderer, error) {
+	// Several of Dora's real template helpers (ethBlockHashLink, ethBlockLink,
+	// formatEthAddressFullLink, …) dereference the package-global utils.Config.
+	// lean-dora never loads a Dora config, so seed a zero-value one if unset:
+	// ExecutionIndexer.Enabled == false and an empty EthExplorerLink make those
+	// helpers degrade to plain (greyed) text instead of nil-panicking. This is
+	// idempotent and safe to run from both the server and tests.
+	if utils.Config == nil {
+		utils.Config = &types.Config{}
+	}
+
 	r := &renderer{cache: make(map[string]*template.Template)}
 
 	// Funcs: start from Dora's full helper set (every helper the index templates
@@ -160,10 +171,55 @@ func newRenderer() (*renderer, error) {
 		return nil, err
 	}
 
+	// --- Slots list + slot detail on Dora's REAL chrome + REAL templates. ---
+	// The slots list pulls in _svg/professor.html for the empty-state graphic.
+	if err := r.registerDora(funcs, layoutSrc, "slots",
+		"_layout/header.html",
+		"_layout/footer.html",
+		"_svg/timeline.html",
+		"_svg/professor.html",
+		"slots/slots.html",
+	); err != nil {
+		return nil, err
+	}
+	// The slot detail page is assembled from slot.html (shell + tab list) plus
+	// the overview and attestations sub-templates. The eth-only sub-tabs are
+	// gated on *Count fields that lean always leaves at 0, so their sub-templates
+	// (block_transactions, block_deposits, …) are never invoked and need not be
+	// parsed in.
+	if err := r.registerDora(funcs, layoutSrc, "slot",
+		"_layout/header.html",
+		"_layout/footer.html",
+		"_svg/timeline.html",
+		"slot/slot.html",
+		"slot/overview.html",
+		"slot/attestations.html",
+	); err != nil {
+		return nil, err
+	}
+	// slot.html references the eth-only block_* sub-templates inside branches
+	// that lean never takes; html/template still resolves those references at
+	// parse time, so parse in empty stubs for them.
+	stubSrc, err := leanTemplates.ReadFile("templates/lean/_slot_stubs.html")
+	if err != nil {
+		return nil, fmt.Errorf("read slot stubs: %w", err)
+	}
+	if _, err := r.cache["slot"].Parse(string(stubSrc)); err != nil {
+		return nil, fmt.Errorf("parse slot stubs: %w", err)
+	}
+	// The slot "not found" page redefines "page"/"js"/"css", so it cannot share a
+	// cache entry with slot.html; register it on its own.
+	if err := r.registerDora(funcs, layoutSrc, "slotnotfound",
+		"_layout/header.html",
+		"_layout/footer.html",
+		"_svg/timeline.html",
+		"slot/notfound.html",
+	); err != nil {
+		return nil, err
+	}
+
 	// --- Remaining lean pages on the hand-rolled lean chrome. ---
 	leanPages := map[string]string{
-		"slots":      "templates/lean/slots.html",
-		"slot":       "templates/lean/slot.html",
 		"finality":   "templates/lean/finality.html",
 		"validators": "templates/lean/validators.html",
 		"forkchoice": "templates/lean/forkchoice.html",

@@ -1,0 +1,29 @@
+{{/*
+Empty stubs for the eth-only slot sub-tab templates referenced by Dora's
+templates/slot/slot.html. Go's html/template resolves every {{ template "x" }}
+reference at PARSE time, even inside a branch that is never taken at execution.
+The lean explorer never populates the *Count fields that gate these tabs, so the
+branches are always skipped; but the references must still resolve. Defining each
+as empty satisfies the parser without rendering any fabricated eth data.
+
+block_overview and block_attestations are intentionally NOT stubbed here: they
+are provided by templates/slot/overview.html and templates/slot/attestations.html.
+*/}}
+{{ define "block_transactions" }}{{ end }}
+{{ define "block_deposits" }}{{ end }}
+{{ define "block_voluntary_exits" }}{{ end }}
+{{ define "block_attesterSlashing" }}{{ end }}
+{{ define "block_proposerSlashing" }}{{ end }}
+{{ define "block_withdrawals" }}{{ end }}
+{{ define "block_blsChange" }}{{ end }}
+{{ define "block_blobSidecar" }}{{ end }}
+{{ define "block_deposit_requests" }}{{ end }}
+{{ define "block_withdrawal_requests" }}{{ end }}
+{{ define "block_consolidation_requests" }}{{ end }}
+{{ define "block_builder_deposit_requests" }}{{ end }}
+{{ define "block_builder_exit_requests" }}{{ end }}
+{{ define "block_access_list" }}{{ end }}
+{{ define "block_bids" }}{{ end }}
+{{ define "block_ptc_votes" }}{{ end }}
+{{ define "block_inclusion_lists" }}{{ end }}
+{{ define "block_proofs" }}{{ end }}
