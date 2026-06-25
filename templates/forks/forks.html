@@ -29,7 +29,7 @@
                 {{ range $i, $fork := .Forks }}
                   <tr>
                     <td rowspan="{{ $fork.ClientCount }}">
-                      {{ if eq $i 0 }}
+                      {{ if $fork.Canonical }}
                         <span class="badge rounded-pill text-bg-success">Canonical</span>
                       {{ else }}
                         <span class="badge rounded-pill text-bg-warning">Fork #{{ $i }}</span>

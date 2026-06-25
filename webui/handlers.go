@@ -23,7 +23,10 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 	head, justified, finalized := s.indexer.HeadState()
 	vc := s.validatorCount(ctx)
-	slots, _ := db.GetSlotsByRange(ctx, sub(head, dashboardRows-1), head, dashboardRows)
+	slots, err := db.GetSlotsByRange(ctx, sub(head, dashboardRows-1), head, dashboardRows)
+	if err != nil {
+		s.logger.WithError(err).Warn("dashboard: failed to load recent slots")
+	}
 
 	data := &IndexPageData{
 		// Lean has no epochs: map slot 1:1 onto the epoch chrome so the
@@ -143,7 +146,10 @@ func (s *Server) handleSlots(w http.ResponseWriter, r *http.Request) {
 		maxSlot = head
 	}
 	minSlot := sub(maxSlot, slotsPerPage-1)
-	slots, _ := db.GetSlotsByRange(ctx, minSlot, maxSlot, slotsPerPage)
+	slots, err := db.GetSlotsByRange(ctx, minSlot, maxSlot, slotsPerPage)
+	if err != nil {
+		s.logger.WithError(err).Warn("slots: failed to load slot range")
+	}
 
 	rows := make([]*SlotsPageDataSlot, 0, len(slots))
 	var firstSlot, lastSlot uint64
@@ -238,10 +244,17 @@ func (s *Server) handleSlotDetail(w http.ResponseWriter, r *http.Request) {
 	var slot *dbtypes.Slot
 	if strings.HasPrefix(id, "0x") {
 		if b, err := hexToBytes(id); err == nil {
-			slot, _ = db.GetSlotByRoot(ctx, b)
+			var gerr error
+			if slot, gerr = db.GetSlotByRoot(ctx, b); gerr != nil {
+				s.logger.WithError(gerr).Warn("slot detail: failed to load slot by root")
+			}
 		}
 	} else if n, err := strconv.ParseUint(id, 10, 64); err == nil {
-		if slots, _ := db.GetSlotsByRange(ctx, n, n, 2); len(slots) > 0 {
+		slots, gerr := db.GetSlotsByRange(ctx, n, n, 2)
+		if gerr != nil {
+			s.logger.WithError(gerr).Warn("slot detail: failed to load slot by number")
+		}
+		if len(slots) > 0 {
 			// Prefer the canonical row if multiple exist at this slot.
 			slot = slots[0]
 			for _, sr := range slots {
@@ -258,7 +271,10 @@ func (s *Server) handleSlotDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	votes, _ := db.GetVotesForSlot(ctx, slot.Slot)
+	votes, err := db.GetVotesForSlot(ctx, slot.Slot)
+	if err != nil {
+		s.logger.WithError(err).Warn("slot detail: failed to load votes")
+	}
 	data := s.toSlotPage(ctx, slot, votes, head, finalized)
 	s.renderer.render(w, "slot", "lean-dora · Slot "+strconv.FormatUint(slot.Slot, 10), "/slot/", data)
 }
@@ -336,8 +352,14 @@ func (s *Server) handleFinality(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	_, justified, finalized := s.indexer.HeadState()
-	fcps, _ := db.GetCheckpoints(ctx, dbtypes.CheckpointFinalized, 50)
-	jcps, _ := db.GetCheckpoints(ctx, dbtypes.CheckpointJustified, 50)
+	fcps, err := db.GetCheckpoints(ctx, dbtypes.CheckpointFinalized, 50)
+	if err != nil {
+		s.logger.WithError(err).Warn("finality: failed to load finalized checkpoints")
+	}
+	jcps, err := db.GetCheckpoints(ctx, dbtypes.CheckpointJustified, 50)
+	if err != nil {
+		s.logger.WithError(err).Warn("finality: failed to load justified checkpoints")
+	}
 
 	data := struct {
 		JustifiedSlot uint64
@@ -357,7 +379,10 @@ func (s *Server) handleValidators(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := s.reqCtx(r)
 	defer cancel()
 
-	validators, _ := db.GetValidators(ctx)
+	validators, err := db.GetValidators(ctx)
+	if err != nil {
+		s.logger.WithError(err).Warn("validators: failed to load validator registry")
+	}
 
 	// The lean validator registry is small and static (no activation queue, no
 	// exits, no balances), so we serve the whole set on a single page and ignore
@@ -404,6 +429,52 @@ func (s *Server) handleValidators(w http.ResponseWriter, r *http.Request) {
 		}},
 	}
 	s.renderer.render(w, "validators", "lean-dora · Validators", "/validators", data)
+}
+
+// handleValidatorDetail renders a minimal validator-detail page. The lean
+// indexer has no rich validator registry (no balances, epochs, or withdrawal
+// data), so the page shows only the index plus the validator's XMSS public keys
+// when the index is in the registry; the eth-only fields render as "—". This
+// exists so proposer links on the slot-detail page (/validator/{index}) resolve
+// to a styled page instead of a 404.
+func (s *Server) handleValidatorDetail(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := s.reqCtx(r)
+	defer cancel()
+
+	id := strings.TrimPrefix(r.URL.Path, "/validator/")
+	if i := strings.IndexByte(id, '/'); i >= 0 {
+		id = id[:i]
+	}
+
+	data := struct {
+		Index             uint64
+		Found             bool
+		AttestationPubkey []byte
+		ProposalPubkey    []byte
+	}{}
+
+	n, err := strconv.ParseUint(id, 10, 64)
+	if err != nil {
+		// Non-numeric index: render the page with Found=false rather than 404.
+		s.renderer.render(w, "validator", "lean-dora · Validator", "/validators", data)
+		return
+	}
+	data.Index = n
+
+	validators, err := db.GetValidators(ctx)
+	if err != nil {
+		s.logger.WithError(err).Warn("validator detail: failed to load validators")
+	}
+	for _, v := range validators {
+		if v.Index == n {
+			data.Found = true
+			data.AttestationPubkey = v.AttestationPubkey
+			data.ProposalPubkey = v.ProposalPubkey
+			break
+		}
+	}
+
+	s.renderer.render(w, "validator", "lean-dora · Validator "+strconv.FormatUint(n, 10), "/validators", data)
 }
 
 func (s *Server) handleForkChoice(w http.ResponseWriter, r *http.Request) {

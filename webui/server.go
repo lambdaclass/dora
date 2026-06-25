@@ -57,6 +57,21 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/slot/", s.handleSlotDetail)
 	mux.HandleFunc("/finality", s.handleFinality)
 	mux.HandleFunc("/validators", s.handleValidators)
+	mux.HandleFunc("/validator/", s.handleValidatorDetail)
+
+	// Header search form + typeahead AJAX endpoints (see static/js/explorer.js).
+	// The form GETs /search?q=; the typeahead hits /search/<category>?q=.
+	mux.HandleFunc("/search", s.handleSearch)
+	mux.HandleFunc("/search/slots", s.handleSearchSlots)
+	// Lean has no equivalent for these categories: return an empty 200 result so
+	// the always-visible search box stops 404ing on every keystroke.
+	mux.HandleFunc("/search/epochs", s.handleSearchEmpty)
+	mux.HandleFunc("/search/validator", s.handleSearchEmpty)
+	mux.HandleFunc("/search/graffiti", s.handleSearchEmpty)
+	mux.HandleFunc("/search/addresses", s.handleSearchEmpty)
+	mux.HandleFunc("/search/transactions", s.handleSearchEmpty)
+	mux.HandleFunc("/search/execblocks", s.handleSearchEmpty)
+	mux.HandleFunc("/search/valname", s.handleSearchEmpty)
 	mux.HandleFunc("/clients", s.handleClients)
 	mux.HandleFunc("/forks", s.handleForks)
 	mux.HandleFunc("/chain_forks", s.handleChainForks)

@@ -13,9 +13,13 @@ import (
 	"github.com/ethpandaops/dora/utils"
 )
 
-// leanTemplates holds the lean page templates plus the shared lean chrome
-// (_lean.html, which (re)defines header/footer/css/js). They are embedded so the
-// binary is self-contained and never reads templates from disk at runtime.
+// leanTemplates holds the lean-specific page bodies and shared sub-templates
+// that have no Dora equivalent: the finality / forkchoice / validator page
+// "page" blocks, the _helpers.html sub-templates (rootLink/statusBadge) and the
+// _slot_stubs.html stubs parsed into the slot-detail entry. They render on
+// Dora's REAL _layout chrome (via registerDora); these files supply only the
+// page body, not chrome. They are embedded so the binary is self-contained and
+// never reads templates from disk at runtime.
 //
 //go:embed templates/lean/*.html
 var leanTemplates embed.FS
@@ -120,12 +124,13 @@ func leanMainMenu() []mainMenuItem {
 	}
 }
 
-// renderer compiles and caches the explorer page templates. The homepage
-// ("dashboard") is assembled from Dora's real layout + header + footer + svg
-// chrome plus the real templates/index/*.html files, so it is pixel-identical
-// to Dora. The remaining lean pages keep the hand-rolled lean chrome
-// (_lean.html) for now; both are valid "layout" templates in separate cache
-// entries.
+// renderer compiles and caches the explorer page templates. EVERY page renders
+// through Dora's REAL chrome: each cache entry is assembled by registerDora from
+// Dora's real _layout/header/footer/timeline plus a page body. Most pages reuse
+// Dora's real page templates (index/*, slots/*, slot/*, validators/*, …); the
+// few lean-specific pages with no Dora equivalent (finality, forkchoice,
+// validator) supply a hand-rolled "page" body from templates/lean/ but still use
+// the same Dora layout chrome. There is no separate hand-rolled chrome.
 type renderer struct {
 	cache map[string]*template.Template
 }
@@ -297,12 +302,11 @@ func newRenderer() (*renderer, error) {
 		return nil, err
 	}
 
-	// --- Finality + Fork Choice: lean-specific pages on Dora's REAL chrome. ---
-	// These have no Dora equivalent template, so they keep their hand-rolled
-	// "page" bodies but now render through Dora's real layout/header/footer (via
+	// --- Finality + Fork Choice + Validator: lean-specific pages on Dora's REAL
+	// chrome. These have no Dora equivalent template, so they supply a hand-rolled
+	// "page" body but render through Dora's real layout/header/footer (via
 	// registerDora) for visual parity with the rest of the explorer. finality.html
-	// uses the rootLink/statusBadge sub-templates that used to live in _lean.html;
-	// they are parsed in from _helpers.html.
+	// uses the rootLink/statusBadge sub-templates parsed in from _helpers.html.
 	helpersSrc, err := leanTemplates.ReadFile("templates/lean/_helpers.html")
 	if err != nil {
 		return nil, fmt.Errorf("read lean helpers: %w", err)
@@ -310,6 +314,7 @@ func newRenderer() (*renderer, error) {
 	leanPages := map[string]string{
 		"finality":   "templates/lean/finality.html",
 		"forkchoice": "templates/lean/forkchoice.html",
+		"validator":  "templates/lean/validator.html",
 	}
 	for name, path := range leanPages {
 		if err := r.registerDora(funcs, layoutSrc, name,

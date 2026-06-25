@@ -17,9 +17,14 @@ type ForksPageData struct {
 }
 
 // ForksPageDataFork is one fork (one head) with the clients that follow it.
+// Canonical marks the fork whose head matches the fork-choice head. It is true
+// only for the front fork when a canonical leaf was actually found; if the
+// fork-choice head is not itself a leaf, no fork is canonical and the template
+// labels them all "Fork #N".
 type ForksPageDataFork struct {
 	HeadSlot    uint64                 `json:"head_slot"`
 	HeadRoot    []byte                 `json:"head_root"`
+	Canonical   bool                   `json:"canonical"`
 	Clients     []*ForksPageDataClient `json:"clients"`
 	ClientCount uint64                 `json:"client_count"`
 }

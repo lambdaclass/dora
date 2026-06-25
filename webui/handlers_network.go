@@ -109,6 +109,11 @@ func (s *Server) forksFromForkChoice(fc *leanapi.ForkChoice, clientVersion strin
 	}
 
 	headHeadSlot := uint64(0)
+	// canonicalFound tracks whether a leaf actually matched fc.Head. If the head
+	// is not itself a leaf (e.g. fc.Head sits mid-tree), no fork is canonical;
+	// without this guard the loops below would mislabel forks[0] as "Canonical"
+	// and compute every distance against a bogus headHeadSlot of 0.
+	canonicalFound := false
 
 	var forks []*ForksPageDataFork
 	for _, n := range fc.Nodes {
@@ -123,6 +128,7 @@ func (s *Server) forksFromForkChoice(fc *leanapi.ForkChoice, clientVersion strin
 		}
 		if isCanonical {
 			headHeadSlot = bySlot(n)
+			canonicalFound = true
 		}
 		forks = append(forks, fork)
 		// Reorder canonical fork to front.
@@ -130,13 +136,20 @@ func (s *Server) forksFromForkChoice(fc *leanapi.ForkChoice, clientVersion strin
 			forks[0], forks[len(forks)-1] = forks[len(forks)-1], forks[0]
 		}
 	}
+	// Mark the front fork canonical only when a canonical leaf was actually
+	// found; otherwise no fork is canonical (head sits mid-tree).
+	if canonicalFound && len(forks) > 0 {
+		forks[0].Canonical = true
+	}
 
-	// Attach the single client (the connected node) to each fork. Distance is the
-	// slot gap from the canonical head; 0 for the fork the node actually follows.
+	// Attach the single client (the connected node) to each fork. When a canonical
+	// leaf was found, distance is the slot gap from the canonical head (0 for the
+	// canonical fork at index 0, which the node follows). When no canonical leaf
+	// was found, there is no reference head: leave every distance at 0 and do not
+	// single out forks[0], since none is genuinely canonical.
 	for i, fork := range forks {
-		status := "online"
 		distance := uint64(0)
-		if i != 0 {
+		if canonicalFound && i != 0 {
 			// Non-canonical forks: the node does not follow them.
 			distance = absDiff(headHeadSlot, fork.HeadSlot)
 		}
@@ -144,7 +157,7 @@ func (s *Server) forksFromForkChoice(fc *leanapi.ForkChoice, clientVersion strin
 			Index:       0,
 			Name:        s.nodeName(),
 			Version:     clientVersion,
-			Status:      status,
+			Status:      "online",
 			HeadSlot:    fork.HeadSlot,
 			Distance:    distance,
 			LastRefresh: time.Now().UTC(),
