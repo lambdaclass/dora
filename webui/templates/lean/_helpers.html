@@ -1,0 +1,27 @@
+{{/*
+  Shared lean-page sub-templates. These were originally defined inside
+  _lean.html (the old hand-rolled chrome). They are split out so the
+  lean-specific pages (finality, forkchoice) can render on Dora's REAL
+  _layout chrome via registerDora while still using these helpers.
+*/}}
+
+{{/* statusBadge renders a SlotStatus (0=missed,1=proposed,2=orphaned) as a Bootstrap badge. */}}
+{{ define "statusBadge" }}
+  {{ if eq (statusClass .) "ok" }}
+    <span class="badge rounded-pill text-bg-success">{{ statusLabel . }}</span>
+  {{ else if eq (statusClass .) "warn" }}
+    <span class="badge rounded-pill text-bg-warning">{{ statusLabel . }}</span>
+  {{ else }}
+    <span class="badge rounded-pill text-bg-secondary">{{ statusLabel . }}</span>
+  {{ end }}
+{{ end }}
+
+{{/* rootLink renders a block root as a truncated monospace link with a clipboard-copy affordance. */}}
+{{ define "rootLink" }}
+  {{ if . }}
+    <a href="/slot/{{ fullHex . }}" class="text-truncate d-inline-block align-middle" style="max-width: 200px">{{ shortHex . }}</a>
+    <i class="fa fa-copy text-muted ms-1 p-1" role="button" data-bs-toggle="tooltip" title="Copy to clipboard" data-clipboard-text="{{ fullHex . }}"></i>
+  {{ else }}
+    <span class="text-muted">—</span>
+  {{ end }}
+{{ end }}

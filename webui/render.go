@@ -155,10 +155,6 @@ func newRenderer() (*renderer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read dora layout: %w", err)
 	}
-	chromeSrc, err := leanTemplates.ReadFile("templates/lean/_lean.html")
-	if err != nil {
-		return nil, fmt.Errorf("read lean chrome: %w", err)
-	}
 
 	// --- Homepage on Dora's REAL chrome + REAL index templates. ---
 	if err := r.registerDora(funcs, layoutSrc, "dashboard",
@@ -301,27 +297,38 @@ func newRenderer() (*renderer, error) {
 		return nil, err
 	}
 
-	// --- Remaining lean pages on the hand-rolled lean chrome. ---
+	// --- Finality + Fork Choice: lean-specific pages on Dora's REAL chrome. ---
+	// These have no Dora equivalent template, so they keep their hand-rolled
+	// "page" bodies but now render through Dora's real layout/header/footer (via
+	// registerDora) for visual parity with the rest of the explorer. finality.html
+	// uses the rootLink/statusBadge sub-templates that used to live in _lean.html;
+	// they are parsed in from _helpers.html.
+	helpersSrc, err := leanTemplates.ReadFile("templates/lean/_helpers.html")
+	if err != nil {
+		return nil, fmt.Errorf("read lean helpers: %w", err)
+	}
 	leanPages := map[string]string{
 		"finality":   "templates/lean/finality.html",
 		"forkchoice": "templates/lean/forkchoice.html",
 	}
 	for name, path := range leanPages {
+		if err := r.registerDora(funcs, layoutSrc, name,
+			"_layout/header.html",
+			"_layout/footer.html",
+			"_svg/timeline.html",
+		); err != nil {
+			return nil, err
+		}
+		if _, err := r.cache[name].Parse(string(helpersSrc)); err != nil {
+			return nil, fmt.Errorf("parse lean helpers for %s: %w", name, err)
+		}
 		pageSrc, err := leanTemplates.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("read page %s: %w", name, err)
 		}
-		t := template.New(name).Funcs(funcs)
-		if _, err := t.Parse(string(layoutSrc)); err != nil {
-			return nil, fmt.Errorf("parse layout for %s: %w", name, err)
-		}
-		if _, err := t.Parse(string(chromeSrc)); err != nil {
-			return nil, fmt.Errorf("parse chrome for %s: %w", name, err)
-		}
-		if _, err := t.Parse(string(pageSrc)); err != nil {
+		if _, err := r.cache[name].Parse(string(pageSrc)); err != nil {
 			return nil, fmt.Errorf("parse page %s: %w", name, err)
 		}
-		r.cache[name] = t
 	}
 	return r, nil
 }
