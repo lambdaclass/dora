@@ -243,9 +243,20 @@ func (s *Server) handleEpochs(w http.ResponseWriter, r *http.Request) {
 			canonicalBlockCount = 1
 			proposalParticipation = 100
 		}
+		// Participation is the share of validators that attested to this slot, so
+		// the numerator must be the number of attesting VALIDATORS — len of the
+		// per-validator votes — NOT sl.AttestationCount (the count of aggregated
+		// attestation objects in the block, normally 1, which capped this at
+		// ~1/N and never reached 100% even when every validator voted).
+		voted := uint64(0)
+		if votes, verr := db.GetVotesForSlot(ctx, sl.Slot); verr == nil {
+			voted = uint64(len(votes))
+		} else {
+			s.logger.WithError(verr).Warn("epochs: failed to load votes for slot")
+		}
 		participation := float64(0)
 		if vc > 0 {
-			participation = float64(sl.AttestationCount) / float64(vc) * 100
+			participation = float64(voted) / float64(vc) * 100
 		}
 
 		rows = append(rows, &EpochsPageDataEpoch{
@@ -256,15 +267,15 @@ func (s *Server) handleEpochs(w http.ResponseWriter, r *http.Request) {
 			Synchronized: true,
 
 			CanonicalBlockCount:   canonicalBlockCount,
-			AttestationCount:      sl.AttestationCount,
+			AttestationCount:      voted,
 			SlotsPerEpoch:         1,
 			ProposalParticipation: proposalParticipation,
 
-			// Lean votes are one-per-validator; surface attestation count as the
-			// vote tally and derive participation from the validator set.
-			TotalVoted:              sl.AttestationCount,
-			TargetVoted:             sl.AttestationCount,
-			HeadVoted:               sl.AttestationCount,
+			// Lean votes are one-per-validator; the vote tally is the attesting
+			// validator count and participation is that over the validator set.
+			TotalVoted:              voted,
+			TargetVoted:             voted,
+			HeadVoted:               voted,
 			TotalVoteParticipation:  participation,
 			TargetVoteParticipation: participation,
 			HeadVoteParticipation:   participation,
