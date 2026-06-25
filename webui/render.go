@@ -6,6 +6,7 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
+	"strconv"
 	"time"
 
 	doratemplates "github.com/ethpandaops/dora/templates"
@@ -366,8 +367,11 @@ func (r *renderer) render(w http.ResponseWriter, name, title, path string, data 
 		return
 	}
 	root := pageRoot{
-		BuildTime:  buildTime,
-		ServerTime: time.Now().UTC().Format(time.RFC3339),
+		BuildTime: buildTime,
+		// Epoch milliseconds: explorer.js parseInt()s the server-time meta to
+		// correct relative-time rendering. An RFC3339 string would parse to just
+		// the year (2026), making "now" ~1970 and every delta read "in 20629 days".
+		ServerTime: strconv.FormatInt(time.Now().UnixMilli(), 10),
 		Meta: pageMeta{
 			Title:       title,
 			Description: "lean consensus block explorer",

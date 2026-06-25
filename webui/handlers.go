@@ -35,8 +35,10 @@ func (s *Server) handleIndexData(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	data := s.buildIndexData(ctx)
-	// Match the layout's server-time format (templates/_layout/layout.html).
-	w.Header().Set("X-Server-Time", time.Now().UTC().Format(time.RFC3339))
+	// Epoch milliseconds: page-index.js parseInt()s this header (same as the
+	// server-time meta) to correct relative-time rendering. RFC3339 would parse
+	// to the year only, breaking every delta.
+	w.Header().Set("X-Server-Time", strconv.FormatInt(time.Now().UnixMilli(), 10))
 	writeJSON(w, data)
 }
 
