@@ -169,17 +169,36 @@ func (idx *Indexer) Spec() *lean.ChainSpec {
 	return idx.spec
 }
 
-// indexValidators fetches the fork-choice validator count and, if a full
-// validator registry endpoint were available, would persist it. ethlambda's
-// read API exposes validator_count but not the full registry over a dedicated
-// endpoint, so we record the count; the registry is best-effort.
+// indexValidators fetches the fork-choice validator count and seeds the
+// registry with one entry per validator index (0 .. count-1). ethlambda's read
+// API exposes validator_count but no full registry endpoint, and the finalized
+// state is SSZ-only, so pubkeys/balances are not obtainable cheaply: we seed an
+// index-only registry, leaving attestation/proposal pubkeys nil. The validators
+// page then lists every index with greyed economics (correct for lean).
+// InsertValidator is an upsert per index, so this is idempotent across restarts.
 func (idx *Indexer) indexValidators() {
 	fc, err := idx.client.GetForkChoice(idx.ctx)
 	if err != nil {
 		idx.logger.WithError(err).Debug("could not fetch fork choice for validator count")
 		return
 	}
-	idx.logger.WithField("validator_count", fc.ValidatorCount).Info("validator registry size")
+	count := fc.ValidatorCount
+	idx.logger.WithField("validator_count", count).Info("validator registry size")
+	if count == 0 {
+		return
+	}
+
+	err = db.RunDBTransaction(func(tx *sqlx.Tx) error {
+		for i := uint64(0); i < count; i++ {
+			if err := db.InsertValidator(idx.ctx, &dbtypes.Validator{Index: i}, tx); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		idx.logger.WithError(err).Warn("could not seed validator registry")
+	}
 }
 
 // backfillToHead fetches blocks in pages from the last indexed slot up to the

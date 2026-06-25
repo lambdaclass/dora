@@ -53,6 +53,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) { fileServer.ServeHTTP(w, r) })
 	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) { fileServer.ServeHTTP(w, r) })
 
+	mux.HandleFunc("/index/data", s.handleIndexData)
 	mux.HandleFunc("/slots", s.handleSlots)
 	mux.HandleFunc("/slot/", s.handleSlotDetail)
 	mux.HandleFunc("/finality", s.handleFinality)

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	leanapi "github.com/ethpandaops/dora/clients/consensus/lean"
 	"github.com/ethpandaops/dora/db"
 	"github.com/ethpandaops/dora/dbtypes"
 )
@@ -21,6 +22,28 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := s.reqCtx(r)
 	defer cancel()
 
+	data := s.buildIndexData(ctx)
+	s.renderer.render(w, "dashboard", "lean-dora · Dashboard", "/", data)
+}
+
+// handleIndexData serves the homepage panel feed consumed by page-index.js
+// ($.get("/index/data")). It returns the same IndexPageData handleDashboard
+// renders, as JSON, plus the X-Server-Time header the JS reads to correct
+// relative-time display.
+func (s *Server) handleIndexData(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := s.reqCtx(r)
+	defer cancel()
+
+	data := s.buildIndexData(ctx)
+	// Match the layout's server-time format (templates/_layout/layout.html).
+	w.Header().Set("X-Server-Time", time.Now().UTC().Format(time.RFC3339))
+	writeJSON(w, data)
+}
+
+// buildIndexData assembles the homepage IndexPageData (recent slots/blocks plus
+// the head/finalized/justified summary). Shared by handleDashboard (HTML render)
+// and handleIndexData (JSON feed) so both stay in lockstep.
+func (s *Server) buildIndexData(ctx context.Context) *IndexPageData {
 	head, justified, finalized := s.indexer.HeadState()
 	vc := s.validatorCount(ctx)
 	slots, err := db.GetSlotsByRange(ctx, sub(head, dashboardRows-1), head, dashboardRows)
@@ -28,7 +51,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		s.logger.WithError(err).Warn("dashboard: failed to load recent slots")
 	}
 
-	data := &IndexPageData{
+	return &IndexPageData{
 		// Lean has no epochs: map slot 1:1 onto the epoch chrome so the
 		// "Epoch" / "Current Slot" fields both read the head slot.
 		CurrentEpoch:          head,
@@ -65,7 +88,6 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		RecentBlocks:     s.toIndexBlocks(slots),
 		RecentBlockCount: uint64(len(slots)),
 	}
-	s.renderer.render(w, "dashboard", "lean-dora · Dashboard", "/", data)
 }
 
 // toIndexSlots maps canonical-ordered db slots to the homepage recent-slots
@@ -115,9 +137,9 @@ func (s *Server) networkForks() []*IndexPageDataForks {
 		Active: true,
 		Type:   "consensus",
 	}
-	if s.spec != nil {
-		fork.Time = s.spec.GenesisTime
-		if b, err := hex.DecodeString(strings.TrimPrefix(s.spec.ForkDigest, "0x")); err == nil {
+	if spec := s.chainSpec(); spec != nil {
+		fork.Time = spec.GenesisTime
+		if b, err := hex.DecodeString(strings.TrimPrefix(spec.ForkDigest, "0x")); err == nil {
 			fork.ForkDigest = b
 		}
 	}
@@ -499,19 +521,35 @@ func (s *Server) handleForkChoiceJSON(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, fc)
 }
 
+// chainSpec resolves the chain spec, preferring the snapshot captured at
+// construction but falling back to the indexer's live spec. The indexer fetches
+// the spec asynchronously, so the snapshot handed to NewServer can be nil if the
+// server is built before initSpec completes (a startup race); resolving lazily
+// here ensures timestamps and counts use genesis once it is available rather
+// than falling back to unix-0 forever.
+func (s *Server) chainSpec() *leanapi.ChainSpec {
+	if s.spec != nil {
+		return s.spec
+	}
+	if s.indexer != nil {
+		return s.indexer.Spec()
+	}
+	return nil
+}
+
 func (s *Server) validatorCount(ctx context.Context) uint64 {
 	if c, err := db.GetValidatorCount(ctx); err == nil && c > 0 {
 		return c
 	}
-	if s.spec != nil {
-		return s.spec.ValidatorCount
+	if spec := s.chainSpec(); spec != nil {
+		return spec.ValidatorCount
 	}
 	return 0
 }
 
 func (s *Server) slotSeconds() uint64 {
-	if s.spec != nil && s.spec.MillisecondsPerSlot > 0 {
-		return s.spec.MillisecondsPerSlot / 1000
+	if spec := s.chainSpec(); spec != nil && spec.MillisecondsPerSlot > 0 {
+		return spec.MillisecondsPerSlot / 1000
 	}
 	return 4
 }
@@ -519,24 +557,24 @@ func (s *Server) slotSeconds() uint64 {
 // slotTime returns the wall-clock time for a slot from the chain spec, falling
 // back to genesis + slot*slotSeconds when SlotToTime is unavailable.
 func (s *Server) slotTime(slot uint64) time.Time {
-	if s.spec != nil {
-		return s.spec.SlotToTime(slot)
+	if spec := s.chainSpec(); spec != nil {
+		return spec.SlotToTime(slot)
 	}
 	return time.Unix(int64(slot*s.slotSeconds()), 0).UTC()
 }
 
 // genesisTime returns the chain genesis time, or the zero time if unknown.
 func (s *Server) genesisTime() time.Time {
-	if s.spec != nil {
-		return s.spec.GenesisTimestamp()
+	if spec := s.chainSpec(); spec != nil {
+		return spec.GenesisTimestamp()
 	}
 	return time.Time{}
 }
 
 // networkName derives a display name for the lean network from the fork digest.
 func (s *Server) networkName() string {
-	if s.spec != nil && s.spec.ForkDigest != "" {
-		return "lean-" + strings.TrimPrefix(s.spec.ForkDigest, "0x")
+	if spec := s.chainSpec(); spec != nil && spec.ForkDigest != "" {
+		return "lean-" + strings.TrimPrefix(spec.ForkDigest, "0x")
 	}
 	return "lean"
 }
