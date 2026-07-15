@@ -138,6 +138,32 @@ type TransactionPageData struct {
 	// State changes tab (prestateTracer diffMode)
 	StateChanges             []*TransactionPageDataStateChangeAccount `json:"state_changes"`
 	StateChangesNotAvailable bool                                     `json:"state_changes_not_available"`
+
+	// Frame transaction (EIP-8141, tx type 0x06)
+	IsFrameTx           bool                        `json:"is_frame_tx"`
+	Frames              []*TransactionPageDataFrame `json:"frames"`
+	HasFramePayer       bool                        `json:"has_frame_payer"`
+	FramePayer          []byte                      `json:"frame_payer" ssz-size:"20"`
+	FramePayerIsSender  bool                        `json:"frame_payer_is_sender"`
+	FrameSignatureCount int                         `json:"frame_signature_count"`
+}
+
+// TransactionPageDataFrame is one frame of an EIP-8141 frame transaction,
+// paired with its per-frame execution result.
+type TransactionPageDataFrame struct {
+	Index     int    `json:"index"`
+	Mode      uint8  `json:"mode"`
+	ModeName  string `json:"mode_name"`  // DEFAULT/VERIFY/SENDER/POST_TX
+	Flags     uint8  `json:"flags"`
+	FlagsDesc string `json:"flags_desc"` // decoded APPROVE scope + atomic-batch
+	HasTarget bool   `json:"has_target"`
+	Target    []byte `json:"target" ssz-size:"20"`
+	Value     string `json:"value"`     // decimal wei
+	DataSize  int    `json:"data_size"` // len(data) in bytes
+	HasResult bool   `json:"has_result"`
+	Success   bool   `json:"success"`
+	GasUsed   uint64 `json:"gas_used"`
+	LogCount  int    `json:"log_count"`
 }
 
 // TransactionPageDataStateChangeAccount represents state changes for a single account.

@@ -40,6 +40,7 @@ var txTypeNames = map[uint8]string{
 	2: "Dynamic Fee (EIP-1559)",
 	3: "Blob (EIP-4844)",
 	4: "Set Code (EIP-7702)",
+	6: "Frame (EIP-8141)",
 }
 
 // Transaction handles the /tx/{hash} page
@@ -378,6 +379,11 @@ func buildTransactionPageDataFromDB(ctx context.Context, pageData *models.Transa
 	} else {
 		pageData.TxTypeName = fmt.Sprintf("Type %d", tx.TxType)
 	}
+	// Frame transactions (EIP-8141): frames aren't persisted in the DB, so
+	// re-derive them from the EL for the frame panel.
+	if tx.TxType == ethtypes.FrameTxType {
+		loadFrameTxDataFromEL(ctx, pageData, tx.TxHash)
+	}
 	pageData.Nonce = tx.Nonce
 	pageData.TxIndex = uint32(tx.TxUid & 0xFFFF)
 
@@ -544,6 +550,11 @@ func buildTransactionPageDataFromEL(ctx context.Context, pageData *models.Transa
 		loadAuthorizationData(pageData, ethTx)
 	}
 
+	// Frame data for type 6 (EIP-8141) transactions
+	if ethTx.Type() == ethtypes.FrameTxType {
+		populateFramesFromTx(pageData, ethTx)
+	}
+
 	// Generate RLP and JSON
 	if rlpData, err := ethTx.MarshalBinary(); err == nil {
 		pageData.TxRLP = "0x" + hex.EncodeToString(rlpData)
@@ -586,6 +597,11 @@ func buildTransactionPageDataFromEL(ctx context.Context, pageData *models.Transa
 			pageData.GasUsed = receipt.GasUsed
 			if pageData.GasLimit > 0 {
 				pageData.GasUsedPct = float64(receipt.GasUsed) / float64(pageData.GasLimit) * 100
+			}
+
+			// Per-frame results + payer for frame transactions (EIP-8141)
+			if pageData.IsFrameTx {
+				populateFrameResults(pageData, receipt)
 			}
 
 			// Calculate tx fee using effective gas price
@@ -1559,5 +1575,125 @@ func resolveAuthorizationValidity(
 		} else {
 			auth.Applied = 2 // not applied
 		}
+	}
+}
+
+// frameModeName maps an EIP-8141 frame mode byte to a human-readable name.
+func frameModeName(mode uint8) string {
+	switch mode {
+	case 0:
+		return "DEFAULT"
+	case 1:
+		return "VERIFY"
+	case 2:
+		return "SENDER"
+	case 3:
+		return "POST_TX"
+	default:
+		return fmt.Sprintf("RESERVED(%d)", mode)
+	}
+}
+
+// frameFlagsDesc decodes an EIP-8141 frame flags byte: the APPROVE scope
+// (bits 0-1) plus the atomic-batch bit (bit 2).
+func frameFlagsDesc(flags uint8) string {
+	var scope string
+	switch flags & 0x03 {
+	case 0x00:
+		scope = "APPROVE none"
+	case 0x01:
+		scope = "APPROVE payment"
+	case 0x02:
+		scope = "APPROVE execution"
+	case 0x03:
+		scope = "APPROVE execution+payment"
+	}
+	if flags&0x04 != 0 {
+		scope += ", atomic-batch"
+	}
+	return scope
+}
+
+// populateFramesFromTx fills the frame structure of the page model from a
+// decoded EIP-8141 frame transaction.
+func populateFramesFromTx(pageData *models.TransactionPageData, ethTx *ethtypes.Transaction) {
+	pageData.IsFrameTx = true
+	frames := ethTx.Frames()
+	pageData.Frames = make([]*models.TransactionPageDataFrame, len(frames))
+	for i, f := range frames {
+		mf := &models.TransactionPageDataFrame{
+			Index:     i,
+			Mode:      f.Mode,
+			ModeName:  frameModeName(f.Mode),
+			Flags:     f.Flags,
+			FlagsDesc: frameFlagsDesc(f.Flags),
+			DataSize:  len(f.Data),
+			Value:     "0",
+		}
+		if f.Target != nil {
+			mf.HasTarget = true
+			mf.Target = f.Target.Bytes()
+		}
+		if f.Value != nil {
+			mf.Value = f.Value.String()
+		}
+		pageData.Frames[i] = mf
+	}
+	pageData.FrameSignatureCount = len(ethTx.FrameSignatures())
+}
+
+// populateFrameResults pairs each frame with its per-frame receipt result and
+// records the resolved payer.
+func populateFrameResults(pageData *models.TransactionPageData, receipt *ethtypes.Receipt) {
+	for i, fr := range receipt.FrameReceipts {
+		if i >= len(pageData.Frames) {
+			break
+		}
+		pageData.Frames[i].HasResult = true
+		pageData.Frames[i].Success = fr.Status == 1
+		pageData.Frames[i].GasUsed = fr.GasUsed
+		pageData.Frames[i].LogCount = len(fr.Logs)
+	}
+	if receipt.Payer != nil {
+		pageData.HasFramePayer = true
+		pageData.FramePayer = receipt.Payer.Bytes()
+		pageData.FramePayerIsSender = bytes.Equal(pageData.FramePayer, pageData.FromAddr)
+	}
+}
+
+// loadFrameTxDataFromEL re-derives frame data for a frame transaction served
+// from the database (which does not persist frames) by fetching the tx and
+// receipt from a ready EL client and populating the frame model.
+func loadFrameTxDataFromEL(ctx context.Context, pageData *models.TransactionPageData, txHash []byte) {
+	txIndexer := services.GlobalBeaconService.GetTxIndexer()
+	if txIndexer == nil {
+		return
+	}
+	clients := txIndexer.GetReadyClients()
+	if len(clients) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	txHashCommon := common.BytesToHash(txHash)
+
+	for _, client := range clients {
+		rpcClient := client.GetRPCClient()
+		if rpcClient == nil {
+			continue
+		}
+		ethClient := rpcClient.GetEthClient()
+		if ethClient == nil {
+			continue
+		}
+		ethTx, _, err := ethClient.TransactionByHash(ctx, txHashCommon)
+		if err != nil || ethTx == nil || ethTx.Type() != ethtypes.FrameTxType {
+			continue
+		}
+		populateFramesFromTx(pageData, ethTx)
+		if receipt, err := ethClient.TransactionReceipt(ctx, txHashCommon); err == nil && receipt != nil {
+			populateFrameResults(pageData, receipt)
+		}
+		return
 	}
 }

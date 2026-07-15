@@ -137,6 +137,57 @@
       </div>
     </div>
 
+    {{ if .IsFrameTx }}
+    <div class="card mt-2">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span>Frames <span class="badge bg-secondary" data-bs-toggle="tooltip" title="EIP-8141 frame transaction (type 0x06)">EIP-8141</span></span>
+        <span class="text-muted" style="font-size:0.85rem">{{ len .Frames }} frame{{ if ne (len .Frames) 1 }}s{{ end }} · {{ .FrameSignatureCount }} signature{{ if ne .FrameSignatureCount 1 }}s{{ end }}</span>
+      </div>
+      <div class="card-body px-0 py-3">
+        {{ if .HasFramePayer }}
+        <div class="row border-bottom p-2 mx-0">
+          <div class="col-md-3"><span data-bs-toggle="tooltip" data-bs-placement="top" title="Account charged for gas, resolved via APPROVE">Payer:</span></div>
+          <div class="col-md-9 text-monospace text-break">
+            {{ $payer := formatEthAddressFull .FramePayer }}
+            <a href="/address/{{ $payer }}">{{ $payer }}</a>
+            {{ if .FramePayerIsSender }}<span class="badge bg-light text-dark ms-1">sender</span>{{ end }}
+          </div>
+        </div>
+        {{ end }}
+        <div class="table-responsive px-2 pt-2">
+          <table class="table table-sm mb-0" style="font-size:0.9rem">
+            <thead>
+              <tr>
+                <th>#</th><th>Mode</th><th>Scope</th><th>Target</th>
+                <th class="text-end">Value</th><th class="text-end">Data</th><th>Result</th>
+              </tr>
+            </thead>
+            <tbody>
+              {{ range .Frames }}
+              <tr>
+                <td>{{ .Index }}</td>
+                <td><span class="badge bg-primary" data-bs-toggle="tooltip" title="mode {{ .Mode }}">{{ .ModeName }}</span></td>
+                <td>{{ if .FlagsDesc }}{{ .FlagsDesc }}{{ else }}<span class="text-muted">—</span>{{ end }}</td>
+                <td class="text-monospace text-break">
+                  {{ if .HasTarget }}{{ $t := formatEthAddressFull .Target }}<a href="/address/{{ $t }}">{{ $t }}</a>{{ else }}<span class="text-muted">create</span>{{ end }}
+                </td>
+                <td class="text-end">{{ .Value }} wei</td>
+                <td class="text-end">{{ .DataSize }} B</td>
+                <td>
+                  {{ if .HasResult }}
+                    {{ if .Success }}<i class="fas fa-check-circle text-success"></i>{{ else }}<i class="fas fa-times-circle text-danger"></i>{{ end }}
+                    <span class="text-muted ms-1">gas {{ formatAddCommas .GasUsed }}{{ if gt .LogCount 0 }} · {{ .LogCount }} log{{ if ne .LogCount 1 }}s{{ end }}{{ end }}</span>
+                  {{ else }}<span class="text-muted">—</span>{{ end }}
+                </td>
+              </tr>
+              {{ end }}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    {{ end }}
+
     <ul class="nav nav-tabs justify-content-start mt-3" id="tab" role="tablist">
       <li class="nav-item">
         <a class="nav-link{{ if eq .TabView "overview" }} active{{ end }}" id="details-tab" data-lazy-tab="details" data-bs-toggle="tab" data-bs-target="#details" href="?v=overview{{ if gt .SelectedBlockUid 0 }}&b={{ .SelectedBlockUid }}{{ end }}" role="tab" aria-controls="details" aria-selected="{{ if eq .TabView "overview" }}true{{ else }}false{{ end }}">
