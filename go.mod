@@ -6,7 +6,7 @@ require (
 	github.com/Masterminds/sprig/v3 v3.3.0
 	github.com/allegro/bigcache/v3 v3.1.0
 	github.com/cockroachdb/pebble v1.1.5
-	github.com/ethereum/go-ethereum v1.17.4
+	github.com/ethereum/go-ethereum v1.17.2
 	github.com/ethpandaops/eth-das-guardian v0.1.1
 	github.com/ethpandaops/ethcore v0.0.0-20260320045412-9cdd5d70a29c
 	github.com/ethpandaops/ethwallclock v0.4.0
@@ -67,7 +67,6 @@ require (
 	github.com/ethereum/c-kzg-4844/v2 v2.1.6 // indirect
 	github.com/ethereum/go-bigmodexpfix v0.0.0-20250911101455-f9e208c548ab // indirect
 	github.com/filecoin-project/go-clock v0.1.0 // indirect
-	github.com/fjl/jsonw v0.1.0 // indirect
 	github.com/flynn/noise v1.1.0 // indirect
 	github.com/francoispqt/gojay v1.2.13 // indirect
 	github.com/getsentry/sentry-go v0.32.0 // indirect
@@ -138,6 +137,7 @@ require (
 	github.com/pion/sdp/v3 v3.0.16 // indirect
 	github.com/pion/srtp/v3 v3.0.7 // indirect
 	github.com/pion/stun v0.6.1 // indirect
+	github.com/pion/stun/v2 v2.0.0 // indirect
 	github.com/pion/stun/v3 v3.1.2 // indirect
 	github.com/pion/transport/v2 v2.2.10 // indirect
 	github.com/pion/transport/v3 v3.0.7 // indirect
@@ -250,4 +250,4 @@ require (
 	gopkg.in/yaml.v2 v2.4.0
 )
 
-replace github.com/ethereum/go-ethereum => github.com/lambdaclass/go-ethereum v0.0.0-20260715170805-74759a951864
+replace github.com/ethereum/go-ethereum => github.com/lambdaclass/go-ethereum v0.0.0-20260715172247-d3f85ceae3e7
