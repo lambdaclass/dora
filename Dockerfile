@@ -1,7 +1,7 @@
 # node build env
 FROM node:20 AS node-env
 WORKDIR /app
-COPY ui-package/package.json /app
+COPY ui-package/package.json ui-package/package-lock.json /app/
 RUN npm install
 COPY ui-package /app
 RUN npm run build
