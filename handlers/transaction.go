@@ -530,6 +530,14 @@ func buildTransactionPageDataFromEL(ctx context.Context, pageData *models.Transa
 	if ethTx.To() != nil {
 		pageData.ToAddr = ethTx.To().Bytes()
 		pageData.HasTo = true
+	} else if ethTx.Type() == ethtypes.FrameTxType {
+		// Frame txs (EIP-8141) have no single top-level `to` (each frame carries
+		// its own target) and are NOT contract creations. Anchor "to" to the
+		// sender, matching ethrex's receipt `to` field.
+		if s, ok := ethTx.FrameSender(); ok {
+			pageData.ToAddr = s.Bytes()
+			pageData.HasTo = true
+		}
 	} else {
 		pageData.IsCreate = true
 	}

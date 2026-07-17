@@ -219,9 +219,17 @@ func (ctx *txProcessingContext) processTransaction(
 	// 2. Process "to" account (funder is the "from" account)
 	var toAddr common.Address
 	var toAccount *pendingAccount
-	isContractCreation := tx.To() == nil
+	// Frame txs (EIP-8141) have no single top-level `to` (each frame carries its
+	// own target) and are NOT contract creations; anchor "to" to the sender
+	// (matches ethrex's receipt) so we don't fabricate a CREATE(from, nonce)
+	// contract account.
+	isFrameTx := tx.Type() == types.FrameTxType
+	isContractCreation := tx.To() == nil && !isFrameTx
 
-	if isContractCreation {
+	if isFrameTx {
+		toAddr = from
+		toAccount = fromAccount
+	} else if isContractCreation {
 		// Calculate contract address for contract creation
 		toAddr = crypto.CreateAddress(from, tx.Nonce())
 		toAccount = ctx.ensureAccount(toAddr, fromAccount, true)

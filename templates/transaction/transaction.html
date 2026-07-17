@@ -125,7 +125,7 @@
         <div class="row border-bottom p-2 mx-0">
           <div class="col-md-3"><span data-bs-toggle="tooltip" data-bs-placement="top" title="Value transferred">Value:</span></div>
           <div class="col-md-9">
-            {{ formatFloat .Amount 18 }} ETH
+            {{ formatBytesAmount .AmountRaw "ETH" 18 }}
           </div>
         </div>
         <div class="row p-2 mx-0">
