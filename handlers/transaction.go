@@ -1637,9 +1637,35 @@ func populateFramesFromTx(pageData *models.TransactionPageData, ethTx *ethtypes.
 		if f.Value != nil {
 			mf.Value = f.Value.String()
 		}
+		if f.Mode == 3 { // EIP-7906 POST_TX
+			mf.IsPostTx = true
+			pageData.HasPostTx = true
+		}
 		pageData.Frames[i] = mf
 	}
 	pageData.FrameSignatureCount = len(ethTx.FrameSignatures())
+
+	// Hegotá extensions: EIP-8250 keyed nonces + EIP-8272 recent-root references.
+	if ethTx.IsFrameHegota() {
+		pageData.IsHegotaFrameTx = true
+		keys := ethTx.FrameNonceKeys()
+		pageData.FrameNonceKeys = make([]string, len(keys))
+		for i, k := range keys {
+			pageData.FrameNonceKeys[i] = k.String()
+		}
+		if seq, ok := ethTx.FrameNonceSeq(); ok {
+			pageData.FrameNonceSeq = seq
+		}
+		refs := ethTx.FrameRecentRootReferences()
+		pageData.FrameRecentRoots = make([]*models.TransactionPageDataRecentRoot, len(refs))
+		for i, r := range refs {
+			pageData.FrameRecentRoots[i] = &models.TransactionPageDataRecentRoot{
+				SourceID: r.SourceID.Bytes(),
+				Slot:     r.Slot,
+				Root:     r.Root.Bytes(),
+			}
+		}
+	}
 }
 
 // populateFrameResults pairs each frame with its per-frame receipt result and

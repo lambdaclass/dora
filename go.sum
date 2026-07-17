@@ -363,6 +363,10 @@ github.com/kylelemons/godebug v1.1.0 h1:RPNrshWIDI6G2gRW9EHilWtl7Z6Sb1BR0xunSBf0
 github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
 github.com/lambdaclass/go-ethereum v0.0.0-20260715172247-d3f85ceae3e7 h1:ZZl0IgEcCZgPs/+zV303jQS8874Xg8WKr9nQYqQTA68=
 github.com/lambdaclass/go-ethereum v0.0.0-20260715172247-d3f85ceae3e7/go.mod h1:KHcRXfGOUfUmKg51IhQ0IowiqZ6PqZf08CMtk0g5K1o=
+github.com/lambdaclass/go-ethereum v0.0.0-20260717111426-747e61711856 h1:35YyXqzESzwjMwwqaa9frO5Qvewr7AH3VY644deZ6nc=
+github.com/lambdaclass/go-ethereum v0.0.0-20260717111426-747e61711856/go.mod h1:KHcRXfGOUfUmKg51IhQ0IowiqZ6PqZf08CMtk0g5K1o=
+github.com/lambdaclass/go-ethereum v0.0.0-20260717114510-0790a3a92280 h1:GF0RnQRnjIQx218Kt9XIRY/HRf4Abo2G5K8cpJqxgCo=
+github.com/lambdaclass/go-ethereum v0.0.0-20260717114510-0790a3a92280/go.mod h1:KHcRXfGOUfUmKg51IhQ0IowiqZ6PqZf08CMtk0g5K1o=
 github.com/leanovate/gopter v0.2.11 h1:vRjThO1EKPb/1NsDXuDrzldR28RLkBflWYcU9CvzWu4=
 github.com/leanovate/gopter v0.2.11/go.mod h1:aK3tzZP/C+p1m3SPRE4SYZFGP7jjkuSI4f7Xvpt0S9c=
 github.com/lib/pq v1.0.0/go.mod h1:5WUZQaWbwv1U+lTReE5YruASi9Al49XbQIvNi/34Woo=

@@ -146,6 +146,27 @@ type TransactionPageData struct {
 	FramePayer          []byte                      `json:"frame_payer" ssz-size:"20"`
 	FramePayerIsSender  bool                        `json:"frame_payer_is_sender"`
 	FrameSignatureCount int                         `json:"frame_signature_count"`
+
+	// Hegotá frame-tx extensions: EIP-8250 keyed nonces (in place of the single
+	// account nonce) and EIP-8272 recent-root references. IsHegotaFrameTx marks a
+	// frame tx decoded from the 11-field Hegotá envelope.
+	IsHegotaFrameTx  bool                             `json:"is_hegota_frame_tx"`
+	FrameNonceKeys   []string                         `json:"frame_nonce_keys"` // decimal keyed nonces
+	FrameNonceSeq    uint64                           `json:"frame_nonce_seq"`
+	FrameRecentRoots []*TransactionPageDataRecentRoot `json:"frame_recent_roots"`
+
+	// EIP-7906: the transaction has one or more trailing POST_TX frames
+	// (executed after the body via STATICCALL; introspect the tx via the
+	// TXTRACE / EVENTDATACOPY / TXDIFF opcodes).
+	HasPostTx bool `json:"has_post_tx"`
+}
+
+// TransactionPageDataRecentRoot is one EIP-8272 recent-root reference declared by
+// a Hegotá frame transaction.
+type TransactionPageDataRecentRoot struct {
+	SourceID []byte `json:"source_id" ssz-size:"32"`
+	Slot     uint64 `json:"slot"`
+	Root     []byte `json:"root" ssz-size:"32"`
 }
 
 // TransactionPageDataFrame is one frame of an EIP-8141 frame transaction,
@@ -154,6 +175,7 @@ type TransactionPageDataFrame struct {
 	Index     int    `json:"index"`
 	Mode      uint8  `json:"mode"`
 	ModeName  string `json:"mode_name"`  // DEFAULT/VERIFY/SENDER/POST_TX
+	IsPostTx  bool   `json:"is_post_tx"` // EIP-7906 POST_TX frame (mode 3)
 	Flags     uint8  `json:"flags"`
 	FlagsDesc string `json:"flags_desc"` // decoded APPROVE scope + atomic-batch
 	HasTarget bool   `json:"has_target"`

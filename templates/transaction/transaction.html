@@ -140,7 +140,7 @@
     {{ if .IsFrameTx }}
     <div class="card mt-2">
       <div class="card-header d-flex justify-content-between align-items-center">
-        <span>Frames <span class="badge bg-secondary" data-bs-toggle="tooltip" title="EIP-8141 frame transaction (type 0x06)">EIP-8141</span></span>
+        <span>Frames <span class="badge bg-secondary" data-bs-toggle="tooltip" title="EIP-8141 frame transaction (type 0x06)">EIP-8141</span>{{ if .IsHegotaFrameTx }} <span class="badge bg-info" data-bs-toggle="tooltip" title="Hegotá envelope: EIP-8250 keyed nonces + EIP-8272 recent-root references">Hegotá</span>{{ end }}</span>
         <span class="text-muted" style="font-size:0.85rem">{{ len .Frames }} frame{{ if ne (len .Frames) 1 }}s{{ end }} · {{ .FrameSignatureCount }} signature{{ if ne .FrameSignatureCount 1 }}s{{ end }}</span>
       </div>
       <div class="card-body px-0 py-3">
@@ -151,6 +151,33 @@
             {{ $payer := formatEthAddressFull .FramePayer }}
             <a href="/address/{{ $payer }}">{{ $payer }}</a>
             {{ if .FramePayerIsSender }}<span class="badge bg-light text-dark ms-1">sender</span>{{ end }}
+          </div>
+        </div>
+        {{ end }}
+        {{ if .IsHegotaFrameTx }}
+        <div class="row border-bottom p-2 mx-0">
+          <div class="col-md-3"><span data-bs-toggle="tooltip" data-bs-placement="top" title="EIP-8250 keyed nonces: the sequence number and the nonce keys this transaction consumes">Keyed nonces:</span></div>
+          <div class="col-md-9 text-monospace text-break">
+            seq <span class="badge bg-light text-dark">{{ .FrameNonceSeq }}</span>
+            {{ if .FrameNonceKeys }}· keys {{ range $i, $k := .FrameNonceKeys }}{{ if $i }}, {{ end }}<span class="badge bg-secondary">{{ $k }}</span>{{ end }}{{ end }}
+          </div>
+        </div>
+        {{ if .FrameRecentRoots }}
+        <div class="row border-bottom p-2 mx-0">
+          <div class="col-md-3"><span data-bs-toggle="tooltip" data-bs-placement="top" title="EIP-8272 declared recent state-root references">Recent roots:</span></div>
+          <div class="col-md-9 text-monospace text-break" style="font-size:0.82rem">
+            {{ range .FrameRecentRoots }}
+            <div>slot <span class="badge bg-light text-dark">{{ .Slot }}</span> · root {{ printf "0x%x" .Root }} · source {{ printf "0x%x" .SourceID }}</div>
+            {{ end }}
+          </div>
+        </div>
+        {{ end }}
+        {{ end }}
+        {{ if .HasPostTx }}
+        <div class="row border-bottom p-2 mx-0">
+          <div class="col-md-3"><span data-bs-toggle="tooltip" data-bs-placement="top" title="EIP-7906 post-transaction frames">POST_TX:</span></div>
+          <div class="col-md-9" style="font-size:0.85rem">
+            This transaction has trailing <span class="badge bg-dark">POST_TX</span> frame(s), executed after the body via STATICCALL. They introspect the transaction with the <code>TXTRACE</code> / <code>EVENTDATACOPY</code> / <code>TXDIFF</code> opcodes; <code>TXDIFF</code> surfaces the transaction's state changes to the frame at runtime.
           </div>
         </div>
         {{ end }}
@@ -166,7 +193,7 @@
               {{ range .Frames }}
               <tr>
                 <td>{{ .Index }}</td>
-                <td><span class="badge bg-primary" data-bs-toggle="tooltip" title="mode {{ .Mode }}">{{ .ModeName }}</span></td>
+                <td>{{ if .IsPostTx }}<span class="badge bg-dark" data-bs-toggle="tooltip" title="EIP-7906 POST_TX: runs after the transaction body via STATICCALL; introspects the tx via TXTRACE / EVENTDATACOPY / TXDIFF">{{ .ModeName }}</span>{{ else }}<span class="badge bg-primary" data-bs-toggle="tooltip" title="mode {{ .Mode }}">{{ .ModeName }}</span>{{ end }}</td>
                 <td>{{ if .FlagsDesc }}{{ .FlagsDesc }}{{ else }}<span class="text-muted">—</span>{{ end }}</td>
                 <td class="text-monospace text-break">
                   {{ if .HasTarget }}{{ $t := formatEthAddressFull .Target }}<a href="/address/{{ $t }}">{{ $t }}</a>{{ else }}<span class="text-muted">create</span>{{ end }}
