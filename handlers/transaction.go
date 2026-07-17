@@ -671,6 +671,15 @@ func buildTransactionPageDataFromEL(ctx context.Context, pageData *models.Transa
 				}
 			}
 
+			// Beacon block not indexed (historical / EL-only view): derive the
+			// block timestamp from the EL block header so the page doesn't show
+			// the zero time (0001-01-01).
+			if pageData.BlockTime.IsZero() {
+				if header, herr := ethClient.HeaderByHash(ctx, receipt.BlockHash); herr == nil && header != nil {
+					pageData.BlockTime = time.Unix(int64(header.Time), 0)
+				}
+			}
+
 			break
 		}
 	}
