@@ -1112,6 +1112,11 @@ func getSlotPageTransactions(ctx context.Context, pageData *models.SlotPageBlock
 		txTo := tx.To()
 		if txTo != nil {
 			txData.To = txTo.Bytes()
+		} else if txType == uint8(ethtypes.FrameTxType) {
+			// Frame txs (EIP-8141) have no top-level `to` and are not contract
+			// creations; anchor "to" to the sender so the block's tx list doesn't
+			// render them as "Contract Creation".
+			txData.To = txData.From
 		}
 
 		pageData.Transactions = append(pageData.Transactions, txData)
