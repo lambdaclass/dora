@@ -41,13 +41,7 @@ var webpackBaseConfig = {
             presets: [
               "@babel/preset-env",
               "@babel/preset-typescript",
-              "@babel/preset-react"
-            ],
-            plugins: [
-              "@babel/syntax-dynamic-import",
-              "@babel/proposal-class-properties",
-              "@babel/proposal-object-rest-spread",
-              "@babel/plugin-syntax-flow"
+              ["@babel/preset-react", { runtime: "automatic", development: debug }]
             ]
           },
         },

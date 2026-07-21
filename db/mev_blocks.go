@@ -67,16 +67,17 @@ func UpdateMevBlockByEpoch(ctx context.Context, tx *sqlx.Tx, epoch uint64, slots
 	var sql strings.Builder
 	var sqlArgs strings.Builder
 
-	args := []any{
-		epoch * slotsPerEpoch,
-		((epoch + 1) * slotsPerEpoch) - 1,
-	}
+	// sqlite binds $N by the order each placeholder first appears, not by the
+	// number, so they must appear in ascending order. The hash list (inside the
+	// CASE) is emitted before the slot range, so number the hashes first and put
+	// the slot range at the end.
+	args := make([]any, 0, len(canonicalHashes)+2)
 
 	for i, hash := range canonicalHashes {
 		if sqlArgs.Len() > 0 {
 			fmt.Fprint(&sqlArgs, ",")
 		}
-		fmt.Fprintf(&sqlArgs, "$%v", (i + 3))
+		fmt.Fprintf(&sqlArgs, "$%v", (i + 1))
 		args = append(args, hash)
 	}
 
@@ -91,13 +92,15 @@ func UpdateMevBlockByEpoch(ctx context.Context, tx *sqlx.Tx, epoch uint64, slots
 			") THEN 1 ",
 		)
 	}
-	fmt.Fprint(&sql,
-		"WHEN proposed = 0 THEN 0 ",
-		"ELSE 2 ",
-		"END",
-		") ",
-		"WHERE slot_number >= $1 AND slot_number <= $2",
+	fmt.Fprintf(&sql,
+		"WHEN proposed = 0 THEN 0 "+
+			"ELSE 2 "+
+			"END"+
+			") "+
+			"WHERE slot_number >= $%v AND slot_number <= $%v",
+		len(canonicalHashes)+1, len(canonicalHashes)+2,
 	)
+	args = append(args, epoch*slotsPerEpoch, ((epoch+1)*slotsPerEpoch)-1)
 
 	_, err := tx.ExecContext(ctx, sql.String(), args...)
 	if err != nil {
@@ -154,8 +157,7 @@ func GetMevBlocksByBlockHashes(ctx context.Context, blockHashes [][]byte) map[st
 	FROM mev_blocks
 	WHERE block_hash IN (`)
 	appendDollarPlaceholders(&sql, 1, len(blockHashes), ", ")
-	fmt.Fprint(&sql, `
-	`)
+	fmt.Fprint(&sql, ")")
 
 	mevBlocks := []*dbtypes.MevBlock{}
 	err := ReaderDb.SelectContext(ctx, &mevBlocks, sql.String(), queryArgs...)
@@ -240,13 +242,10 @@ func GetMevBlocksFiltered(ctx context.Context, offset uint64, limit uint32, filt
 		filterOp = "AND"
 	}
 	if filter.ProposerName != "" {
-		args = append(args, "%"+filter.ProposerName+"%")
-		fmt.Fprintf(&sql, " %v ", filterOp)
-		fmt.Fprintf(&sql, EngineQuery(map[dbtypes.DBEngineType]string{
-			dbtypes.DBEnginePgsql:  ` validator_names.name ilike $%v `,
-			dbtypes.DBEngineSqlite: ` validator_names.name LIKE $%v `,
-		}), len(args))
-
+		var namePredicate string
+		namePredicate, args = AppendValidatorNameHistoryFilter(args, "mev_blocks.proposer_index", "mev_blocks.slot_number", "",
+			"validator_names.name", "%"+filter.ProposerName+"%", false)
+		fmt.Fprintf(&sql, " %v %v ", filterOp, namePredicate)
 		filterOp = "AND"
 	}
 

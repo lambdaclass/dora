@@ -33,6 +33,9 @@ import (
 	"github.com/ethpandaops/dora/utils"
 )
 
+// EIP-7708: ETH Transfer logger address — emits Transfer(address,address,uint256) on every ETH move.
+var ethTransferLogger = common.HexToAddress("0xfffffffffffffffffffffffffffffffffffffffe")
+
 // Transaction type names
 var txTypeNames = map[uint8]string{
 	0: "Legacy",
@@ -61,7 +64,7 @@ func Transaction(w http.ResponseWriter, r *http.Request) {
 	// Check if execution indexer is enabled
 	if !utils.Config.ExecutionIndexer.Enabled {
 		data := InitPageData(w, r, "blockchain", "/tx", "Feature Disabled", notfoundTemplateFiles)
-		data.Data = "disabled"
+		data.Data = &models.TransactionNotFoundData{Reason: "disabled"}
 		w.Header().Set("Content-Type", "text/html")
 		handleTemplateError(w, r, "transaction.go", "Transaction", "disabled", templates.GetTemplate(notfoundTemplateFiles...).ExecuteTemplate(w, "layout", data))
 		return
@@ -73,6 +76,7 @@ func Transaction(w http.ResponseWriter, r *http.Request) {
 	txHashBytes, err := hex.DecodeString(txHashHex)
 	if err != nil || len(txHashBytes) != 32 {
 		data := InitPageData(w, r, "blockchain", "/tx", "Transaction not found", notfoundTemplateFiles)
+		data.Data = &models.TransactionNotFoundData{Reason: "notfound"}
 		w.Header().Set("Content-Type", "text/html")
 		handleTemplateError(w, r, "transaction.go", "Transaction", "invalidHash", templates.GetTemplate(notfoundTemplateFiles...).ExecuteTemplate(w, "layout", data))
 		return
@@ -106,7 +110,14 @@ func Transaction(w http.ResponseWriter, r *http.Request) {
 
 	if pageData.TxNotFound {
 		data := InitPageData(w, r, "blockchain", "/tx", "Transaction not found", notfoundTemplateFiles)
-		data.Data = "notfound"
+		nf := &models.TransactionNotFoundData{Reason: "notfound"}
+		if ti := services.GlobalBeaconService.GetTxIndexer(); ti != nil {
+			if ps := ti.GetPruningStatus(); ps.DetailsEnabled && ps.DetailsPrunedEpoch > 0 {
+				nf.DetailsEnabled = true
+				nf.DetailsPrunedEpoch = ps.DetailsPrunedEpoch
+			}
+		}
+		data.Data = nf
 		w.Header().Set("Content-Type", "text/html")
 		handleTemplateError(w, r, "transaction.go", "Transaction", "notFound", templates.GetTemplate(notfoundTemplateFiles...).ExecuteTemplate(w, "layout", data))
 		return
@@ -164,11 +175,20 @@ func buildTransactionPageData(ctx context.Context, txHash []byte, tabView string
 		if time.Since(blockTime) > 5*time.Minute {
 			cacheTimeout = 15 * time.Minute
 		}
+		setTransactionEnsNames(ctx, pageData)
 		return pageData, cacheTimeout
 	}
 
-	// Not in DB - try to fetch from EL client
+	// Not in DB - reconstruct from blockdb (relational row pruned but still
+	// within the longer blockdb/details retention).
+	if buildTransactionPageDataFromBlockdb(ctx, pageData, txHash, chainState) {
+		setTransactionEnsNames(ctx, pageData)
+		return pageData, 15 * time.Minute
+	}
+
+	// Not in DB or blockdb - try to fetch from EL client
 	if buildTransactionPageDataFromEL(ctx, pageData, txHash, chainState) {
+		setTransactionEnsNames(ctx, pageData)
 		return pageData, 30 * time.Minute
 	}
 
@@ -176,6 +196,34 @@ func buildTransactionPageData(ctx context.Context, txHash []byte, tabView string
 	pageData.TxNotFound = true
 	pageData.ViewMode = models.TxViewModeNone
 	return pageData, 1 * time.Minute
+}
+
+// setTransactionEnsNames collects every execution address shown on the transaction
+// detail page (main from/to plus the events, token-transfer, internal-tx, access-list,
+// state-change and authorization sub-lists of the active tab) and resolves their ENS
+// names once for client-side display.
+func setTransactionEnsNames(ctx context.Context, pageData *models.TransactionPageData) {
+	ensAddrs := make([][]byte, 0, 8)
+	ensAddrs = append(ensAddrs, pageData.FromAddr, pageData.ToAddr)
+	for _, event := range pageData.Events {
+		ensAddrs = append(ensAddrs, event.SourceAddr, event.EthTransferFrom, event.EthTransferTo)
+	}
+	for _, transfer := range pageData.TokenTransfers {
+		ensAddrs = append(ensAddrs, transfer.Contract, transfer.FromAddr, transfer.ToAddr)
+	}
+	for _, itx := range pageData.InternalTxs {
+		ensAddrs = append(ensAddrs, itx.FromAddr, itx.ToAddr)
+	}
+	for _, entry := range pageData.AccessListEntries {
+		ensAddrs = append(ensAddrs, entry.Address)
+	}
+	for _, change := range pageData.StateChanges {
+		ensAddrs = append(ensAddrs, change.Address)
+	}
+	for _, auth := range pageData.Authorizations {
+		ensAddrs = append(ensAddrs, auth.AuthorityAddr, auth.DelegateAddr)
+	}
+	pageData.SetEnsNames(resolveEnsNames(ctx, ensAddrs))
 }
 
 // buildTransactionPageDataFromDB builds page data from database entries.
@@ -303,9 +351,12 @@ func buildTransactionPageDataFromDB(ctx context.Context, pageData *models.Transa
 	slot := tx.BlockUid >> 16
 	blockTime := chainState.SlotToTime(phase0.Slot(slot))
 
-	pageData.Status = !tx.Reverted
-	if tx.Reverted {
+	pageData.Status = tx.RevertID == 0
+	if tx.RevertID > 0 {
 		pageData.StatusText = "Failed"
+		if reasons, err := db.GetElRevertReasonsByIDs(ctx, []uint32{tx.RevertID}); err == nil {
+			pageData.RevertReason = reasons[tx.RevertID]
+		}
 	} else {
 		pageData.StatusText = "Success"
 	}
@@ -407,13 +458,17 @@ func buildTransactionPageDataFromDB(ctx context.Context, pageData *models.Transa
 	if elBlock, err := db.GetElBlock(ctx, tx.BlockUid); err == nil {
 		pageData.DataStatus = elBlock.DataStatus
 	}
+	// A call trace exists for this tx whenever its block stored call traces, even
+	// if it has only the single root frame (no internal calls aggregated).
+	pageData.HasTrace = pageData.DataStatus&dbtypes.ElBlockDataCallTraces != 0
 
-	// Load tab badge counts using lightweight COUNT queries instead of
-	// loading all rows. This avoids multi-second sequential scans for
-	// transactions with many events or internal calls.
-	eventCount, _ := db.GetElEventIndexCountByTxUid(ctx, tx.TxUid)
-	pageData.EventCount = eventCount
+	// Event count comes straight off the tx row (logs emitted); full event
+	// data is loaded from blockdb when the events tab is opened.
+	pageData.EventCount = uint64(tx.EventCount)
 
+	// Load remaining tab badge counts using lightweight COUNT queries instead
+	// of loading all rows. This avoids multi-second sequential scans for
+	// transactions with many transfers or internal calls.
 	transferCount, _ := db.GetElTokenTransferCountByTxUid(ctx, tx.TxUid)
 	pageData.TokenTransferCount = transferCount
 
@@ -425,7 +480,7 @@ func buildTransactionPageDataFromDB(ctx context.Context, pageData *models.Transa
 	// are loaded from blockdb when available, falling back to DB.
 	switch tabView {
 	case "events":
-		loadTransactionEventsFromBlockdb(ctx, pageData, tx.BlockUid, tx.TxUid)
+		loadTransactionEventsFromBlockdb(ctx, pageData, tx.BlockUid)
 	case "transfers":
 		transfers, _ := db.GetElTokenTransfersByTxUid(ctx, tx.TxUid)
 		loadTransactionTransfersFromData(ctx, pageData, transfers)
@@ -488,75 +543,7 @@ func buildTransactionPageDataFromEL(ctx context.Context, pageData *models.Transa
 	// Transaction found - populate basic fields
 	pageData.ViewMode = models.TxViewModePartial // Start with partial, upgrade if receipt found
 
-	// Basic transaction info from ethTx
-	pageData.TxType = ethTx.Type()
-	if name, ok := txTypeNames[ethTx.Type()]; ok {
-		pageData.TxTypeName = name
-	} else {
-		pageData.TxTypeName = fmt.Sprintf("Type %d", ethTx.Type())
-	}
-
-	pageData.Nonce = ethTx.Nonce()
-	pageData.GasLimit = ethTx.Gas()
-
-	// Value
-	if ethTx.Value() != nil {
-		bigFloat := new(big.Float).SetInt(ethTx.Value())
-		bigFloat.Quo(bigFloat, big.NewFloat(1e18))
-		valueFloat, _ := bigFloat.Float64()
-
-		pageData.Amount = valueFloat
-		pageData.AmountRaw = ethTx.Value().Bytes()
-	}
-
-	// Gas price
-	if ethTx.GasPrice() != nil {
-		gasPriceFloat, _ := new(big.Float).SetInt(ethTx.GasPrice()).Float64()
-		pageData.GasPrice = gasPriceFloat / 1e9 // Convert to Gwei
-	}
-
-	// EIP-1559 tip price
-	if ethTx.Type() >= 2 && ethTx.GasTipCap() != nil {
-		tipFloat, _ := new(big.Float).SetInt(ethTx.GasTipCap()).Float64()
-		pageData.TipPrice = tipFloat / 1e9
-	}
-
-	// From address (need to derive from signature)
-	if from, err := ethtypes.Sender(ethtypes.LatestSignerForChainID(ethTx.ChainId()), ethTx); err == nil {
-		pageData.FromAddr = from.Bytes()
-	}
-
-	// To address
-	if ethTx.To() != nil {
-		pageData.ToAddr = ethTx.To().Bytes()
-		pageData.HasTo = true
-	} else if ethTx.Type() == ethtypes.FrameTxType {
-		// Frame txs (EIP-8141) have no single top-level `to` (each frame carries
-		// its own target) and are NOT contract creations. Anchor "to" to the
-		// sender, matching ethrex's receipt `to` field.
-		if s, ok := ethTx.FrameSender(); ok {
-			pageData.ToAddr = s.Bytes()
-			pageData.HasTo = true
-		}
-	} else {
-		pageData.IsCreate = true
-	}
-
-	// Input data
-	pageData.InputData = ethTx.Data()
-	methodID := []byte(nil)
-	if len(ethTx.Data()) >= 4 {
-		methodID = ethTx.Data()[:4]
-	}
-	applyCallTargetResolution(ctx, pageData, methodID)
-
-	// Blob hashes
-	pageData.BlobCount = uint32(len(ethTx.BlobHashes()))
-
-	// Authorization data for type 4 (EIP-7702) transactions
-	if ethTx.Type() == ethtypes.SetCodeTxType {
-		loadAuthorizationData(pageData, ethTx)
-	}
+	applyEthTxFields(ctx, pageData, ethTx)
 
 	// Frame data for type 6 (EIP-8141) transactions
 	if ethTx.Type() == ethtypes.FrameTxType {
@@ -687,6 +674,243 @@ func buildTransactionPageDataFromEL(ctx context.Context, pageData *models.Transa
 	return true
 }
 
+// applyEthTxFields populates the page-data fields derived from a parsed
+// transaction envelope. Shared by the EL-client and blockdb-reconstruction paths.
+func applyEthTxFields(ctx context.Context, pageData *models.TransactionPageData, ethTx *ethtypes.Transaction) {
+	pageData.TxType = ethTx.Type()
+	if name, ok := txTypeNames[ethTx.Type()]; ok {
+		pageData.TxTypeName = name
+	} else {
+		pageData.TxTypeName = fmt.Sprintf("Type %d", ethTx.Type())
+	}
+
+	pageData.Nonce = ethTx.Nonce()
+	pageData.GasLimit = ethTx.Gas()
+
+	if ethTx.Value() != nil {
+		bigFloat := new(big.Float).SetInt(ethTx.Value())
+		bigFloat.Quo(bigFloat, big.NewFloat(1e18))
+		valueFloat, _ := bigFloat.Float64()
+		pageData.Amount = valueFloat
+		pageData.AmountRaw = ethTx.Value().Bytes()
+	}
+
+	if ethTx.GasPrice() != nil {
+		gasPriceFloat, _ := new(big.Float).SetInt(ethTx.GasPrice()).Float64()
+		pageData.GasPrice = gasPriceFloat / 1e9 // Convert to Gwei
+	}
+
+	if ethTx.Type() >= 2 && ethTx.GasTipCap() != nil {
+		tipFloat, _ := new(big.Float).SetInt(ethTx.GasTipCap()).Float64()
+		pageData.TipPrice = tipFloat / 1e9
+	}
+
+	if from, err := ethtypes.Sender(ethtypes.LatestSignerForChainID(ethTx.ChainId()), ethTx); err == nil {
+		pageData.FromAddr = from.Bytes()
+	}
+
+	if ethTx.To() != nil {
+		pageData.ToAddr = ethTx.To().Bytes()
+		pageData.HasTo = true
+	} else if ethTx.Type() == ethtypes.FrameTxType {
+		// Frame txs (EIP-8141) have no single top-level `to` (each frame carries
+		// its own target) and are NOT contract creations. Anchor "to" to the sender.
+		if s, ok := ethTx.FrameSender(); ok {
+			pageData.ToAddr = s.Bytes()
+			pageData.HasTo = true
+		}
+	} else {
+		pageData.IsCreate = true
+	}
+
+	pageData.InputData = ethTx.Data()
+	applyCalldataCosts(pageData)
+	methodID := []byte(nil)
+	if len(ethTx.Data()) >= 4 {
+		methodID = ethTx.Data()[:4]
+	}
+	applyCallTargetResolution(ctx, pageData, methodID)
+
+	// EIP-7976: calldata floor gas = 21000 + 64 × len(calldata)
+	if len(pageData.InputData) > 0 {
+		pageData.CalldataFloorGas = 21000 + uint64(len(pageData.InputData))*64
+	}
+
+	pageData.BlobCount = uint32(len(ethTx.BlobHashes()))
+
+	if ethTx.Type() == ethtypes.SetCodeTxType {
+		loadAuthorizationData(pageData, ethTx)
+	}
+	if ethTx.Type() == ethtypes.AccessListTxType {
+		loadAccessListData(pageData, ethTx)
+	}
+}
+
+// extractExecTransactions returns the execution-layer transactions from a loaded
+// beacon block (Gloas+ envelope or pre-Gloas payload).
+func extractExecTransactions(blockData *services.CombinedBlockResponse) []bellatrix.Transaction {
+	if blockData.Payload != nil && blockData.Payload.Message != nil && blockData.Payload.Message.Payload != nil {
+		return blockData.Payload.Message.Payload.Transactions
+	}
+	if blockData.Block != nil && blockData.Block.Message != nil && blockData.Block.Message.Body != nil {
+		if ep := blockData.Block.Message.Body.ExecutionPayload; ep != nil {
+			return ep.Transactions
+		}
+	}
+	return nil
+}
+
+// buildTransactionPageDataFromBlockdb reconstructs a transaction from blockdb
+// when its relational row has been pruned: the tx-hash index gives candidate
+// tx_uids, the envelope is decoded from the block's execution payload (and
+// disambiguated by full hash), and receipt metadata is read from blockdb.
+// Returns true if the transaction was reconstructed.
+func buildTransactionPageDataFromBlockdb(ctx context.Context, pageData *models.TransactionPageData, txHash []byte, chainState *consensus.ChainState) bool {
+	if blockdb.GlobalBlockDb == nil || !blockdb.GlobalBlockDb.SupportsTxHashIndex() {
+		return false
+	}
+
+	uids, err := blockdb.GlobalBlockDb.LookupTxHash(ctx, bdbtypes.HashPrefix(txHash))
+	if err != nil || len(uids) == 0 {
+		return false
+	}
+
+	for _, txUid := range uids {
+		blockUid := txUid >> 16
+		txIndex := uint32(txUid & 0xFFFF)
+
+		blocks := services.GlobalBeaconService.GetDbBlocksByFilter(ctx, &dbtypes.BlockFilter{
+			BlockUids:    []uint64{blockUid},
+			WithOrphaned: 1,
+		}, 0, 1, 0)
+		if len(blocks) == 0 || blocks[0].Block == nil {
+			continue
+		}
+		block := blocks[0].Block
+
+		var blockRoot phase0.Root
+		copy(blockRoot[:], block.Root)
+
+		loadCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		blockData, berr := services.GlobalBeaconService.GetSlotDetailsByBlockroot(loadCtx, blockRoot)
+		cancel()
+		if berr != nil || blockData == nil || blockData.Block == nil {
+			continue
+		}
+
+		execTxs := extractExecTransactions(blockData)
+		if int(txIndex) >= len(execTxs) {
+			continue
+		}
+		rlpData := execTxs[txIndex]
+
+		var ethTx ethtypes.Transaction
+		if err := ethTx.UnmarshalBinary(rlpData); err != nil {
+			continue
+		}
+		if !bytes.Equal(ethTx.Hash().Bytes(), txHash) {
+			continue // prefix collision or wrong inclusion block
+		}
+
+		// Match found - reconstruct the page from the envelope.
+		pageData.ViewMode = models.TxViewModePartial
+		applyEthTxFields(ctx, pageData, &ethTx)
+		pageData.TxRLP = "0x" + hex.EncodeToString(rlpData)
+		generateTxJSON(pageData, &ethTx)
+
+		// Block info.
+		pageData.Slot = block.Slot
+		pageData.BlockRoot = block.Root
+		pageData.BlockHash = block.EthBlockHash
+		if block.EthBlockNumber != nil {
+			pageData.BlockNumber = *block.EthBlockNumber
+		}
+		pageData.TxIndex = txIndex
+		pageData.BlockTime = chainState.SlotToTime(phase0.Slot(block.Slot))
+		if phase0.Slot(block.Slot) <= chainState.GetFinalizedSlot() {
+			pageData.TxFinalized = true
+		}
+		isOrphaned := block.Status == dbtypes.Orphaned
+		pageData.TxOrphaned = isOrphaned
+		pageData.InclusionBlocks = []*models.TransactionPageDataBlock{{
+			BlockUid:    blockUid,
+			BlockNumber: pageData.BlockNumber,
+			BlockHash:   block.EthBlockHash,
+			BlockRoot:   block.Root,
+			Slot:        block.Slot,
+			BlockTime:   pageData.BlockTime,
+			IsOrphaned:  isOrphaned,
+			IsCanonical: !isOrphaned,
+			TxIndex:     txIndex,
+		}}
+
+		// Receipt metadata from blockdb (upgrades to full view if available).
+		applyReceiptMetaFromBlockdb(ctx, pageData, block.Slot, block.Root, txHash)
+
+		// Blob data for type 3 (blob) transactions.
+		if ethTx.Type() == 3 && len(ethTx.BlobHashes()) > 0 {
+			loadBlobData(pageData, &ethTx, blockData)
+		}
+
+		return true
+	}
+
+	return false
+}
+
+// applyReceiptMetaFromBlockdb upgrades a reconstructed page to a full view by
+// applying receipt metadata (status, gas used, effective gas price, fee) read
+// from blockdb. No-op if the receipt section is unavailable.
+func applyReceiptMetaFromBlockdb(ctx context.Context, pageData *models.TransactionPageData, slot uint64, blockRoot []byte, txHash []byte) {
+	if blockdb.GlobalBlockDb == nil || !blockdb.GlobalBlockDb.SupportsExecData() {
+		return
+	}
+
+	rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	sections, err := blockdb.GlobalBlockDb.GetExecDataTxSections(rctx, slot, blockRoot, txHash, bdbtypes.ExecDataSectionReceiptMeta)
+	if err != nil || sections == nil || sections.ReceiptMetaData == nil {
+		return
+	}
+
+	metaRaw, err := snappy.Decode(nil, sections.ReceiptMetaData)
+	if err != nil {
+		return
+	}
+	var meta bdbtypes.ReceiptMetaData
+	if err := dynssz.GetGlobalDynSsz().UnmarshalSSZ(&meta, metaRaw); err != nil {
+		return
+	}
+
+	pageData.ViewMode = models.TxViewModeFull
+	pageData.HasReceipt = true
+
+	pageData.Status = meta.Status == 1
+	if pageData.Status {
+		pageData.StatusText = "Success"
+	} else {
+		pageData.StatusText = "Failed"
+	}
+
+	pageData.GasUsed = meta.GasUsed
+	if pageData.GasLimit > 0 {
+		pageData.GasUsedPct = float64(meta.GasUsed) / float64(pageData.GasLimit) * 100
+	}
+
+	effGasPrice := meta.EffectiveGasPrice.ToBig()
+	if effGasPrice.Sign() > 0 {
+		effFloat, _ := new(big.Float).SetInt(effGasPrice).Float64()
+		pageData.EffGasPrice = effFloat / 1e9
+		pageData.TxFee = float64(meta.GasUsed) * effFloat / 1e18
+		txFeeWei := new(big.Int).Mul(effGasPrice, big.NewInt(int64(meta.GasUsed)))
+		pageData.TxFeeRaw = txFeeWei.Bytes()
+		if pageData.TxType >= 2 && pageData.GasPrice > 0 && pageData.EffGasPrice > 0 && pageData.GasPrice > pageData.EffGasPrice {
+			pageData.FeeSavingsPct = (pageData.GasPrice - pageData.EffGasPrice) / pageData.GasPrice * 100
+		}
+	}
+}
+
 // generateTxJSON creates a JSON representation of the transaction using proper marshaling.
 func generateTxJSON(pageData *models.TransactionPageData, ethTx *ethtypes.Transaction) {
 	// Use the transaction's built-in MarshalJSON for standardized format
@@ -704,61 +928,10 @@ func generateTxJSON(pageData *models.TransactionPageData, ethTx *ethtypes.Transa
 	}
 }
 
-// loadTransactionEventsFromIndex populates event tab from the lightweight
-// event index. Full event data (all topics + data blob) will be loaded from
-// blockdb in a future phase. For now, only source address and topic1 (event
-// signature) are shown.
-func loadTransactionEventsFromIndex(ctx context.Context, pageData *models.TransactionPageData, events []*dbtypes.ElEventIndex) {
-	if len(events) == 0 {
-		return
-	}
-
-	// Collect account IDs for batch lookup
-	accountIDs := make(map[uint64]bool, len(events))
-	for _, e := range events {
-		accountIDs[e.SourceID] = true
-	}
-
-	// Batch lookup accounts
-	accountIDList := make([]uint64, 0, len(accountIDs))
-	for id := range accountIDs {
-		accountIDList = append(accountIDList, id)
-	}
-	accountMap := make(map[uint64]*dbtypes.ElAccount, len(accountIDList))
-	if len(accountIDList) > 0 {
-		if accounts, err := db.GetElAccountsByIDs(ctx, accountIDList); err == nil {
-			for _, a := range accounts {
-				accountMap[a.ID] = a
-			}
-		}
-	}
-
-	// Build events list from index entries
-	pageData.Events = make([]*models.TransactionPageDataEvent, 0, len(events))
-	for _, e := range events {
-		event := &models.TransactionPageDataEvent{
-			EventIndex: e.EventIndex,
-		}
-
-		// Source address
-		if source, ok := accountMap[e.SourceID]; ok {
-			event.SourceAddr = source.Address
-			event.SourceIsContract = source.IsContract
-		}
-
-		// Only topic1 (event signature) is available from the index
-		if len(e.Topic1) > 0 {
-			event.Topic0 = e.Topic1
-		}
-
-		pageData.Events = append(pageData.Events, event)
-	}
-}
-
 // loadTransactionEventsFromBlockdb populates the events tab with full event
-// data from blockdb (all topics + data blob). Falls back to loading from
-// the DB event index if blockdb data is unavailable (pruned or not stored).
-func loadTransactionEventsFromBlockdb(ctx context.Context, pageData *models.TransactionPageData, blockUid uint64, txUid uint64) {
+// data from blockdb (all topics + data blob). If blockdb data is unavailable
+// (pruned or not stored), the tab shows the "not available" state.
+func loadTransactionEventsFromBlockdb(ctx context.Context, pageData *models.TransactionPageData, blockUid uint64) {
 	if pageData.EventCount == 0 {
 		return
 	}
@@ -806,9 +979,9 @@ func loadTransactionEventsFromBlockdb(ctx context.Context, pageData *models.Tran
 		}
 	}
 
-	// Fallback: load from DB event index (only when blockdb is unavailable)
-	eventIndices, _ := db.GetElEventIndicesByTxUid(ctx, txUid)
-	loadTransactionEventsFromIndex(ctx, pageData, eventIndices)
+	// blockdb is the only source of event data; if it didn't yield anything,
+	// surface the "not available" state rather than an empty list.
+	pageData.EventsNotAvailable = true
 }
 
 // buildEventsFromBlockdb converts decoded blockdb events to page model events.
@@ -837,6 +1010,31 @@ func buildEventsFromBlockdb(events bdbtypes.EventDataList) []*models.Transaction
 		}
 		if len(ev.Topics) > 4 {
 			event.Topic4 = ev.Topics[4]
+		}
+
+		// EIP-7708: ETH transfers emit a Transfer(address,address,uint256) event from
+		// 0xfffffffffffffffffffffffffffffffffffffffe (the ETH Transfer logger).
+		// Topic0 = keccak256("Transfer(address,address,uint256)") = 0xddf252ad...
+		// Topic1 = from address (padded), Topic2 = to address (padded), Data = uint256 wei.
+		if bytes.Equal(ev.Source[:], ethTransferLogger[:]) {
+			event.EventName = "ETH Transfer (EIP-7708)"
+			// Decode from/to/value from the Transfer event
+			if len(ev.Topics) >= 3 && len(ev.Topics[1]) == 32 && len(ev.Topics[2]) == 32 {
+				event.EthTransferFrom = ev.Topics[1][12:] // last 20 bytes
+				event.EthTransferTo = ev.Topics[2][12:]
+			}
+			if len(ev.Data) >= 32 {
+				weiVal := new(big.Int).SetBytes(ev.Data[:32])
+				// Format as ETH with up to 6 decimal places, trimming trailing zeros
+				eth := new(big.Float).Quo(new(big.Float).SetInt(weiVal), new(big.Float).SetInt(big.NewInt(1e18)))
+				event.EthTransferValue = fmt.Sprintf("%.6f", eth)
+				// Trim trailing zeros after decimal point
+				if strings.Contains(event.EthTransferValue, ".") {
+					event.EthTransferValue = strings.TrimRight(event.EthTransferValue, "0")
+					event.EthTransferValue = strings.TrimRight(event.EthTransferValue, ".")
+				}
+				event.EthTransferValue += " ETH"
+			}
 		}
 
 		result = append(result, event)
@@ -991,12 +1189,9 @@ var callTypeNames = map[uint8]string{
 // with rich call trace data from blockdb (depth, input, output, gas, status).
 // Falls back to loading from the DB index if blockdb data is unavailable.
 func loadTransactionInternalTxsFromBlockdb(ctx context.Context, pageData *models.TransactionPageData, blockUid uint64, txUid uint64) {
-	if pageData.InternalTxCount == 0 {
-		return
-	}
-
 	// If the block says call trace data is unavailable (pruned / not stored),
-	// show the "not available" state instead of the DB-only fallback.
+	// show the "not available" state. Otherwise load the trace even when it has
+	// only the single root frame (no aggregated internal calls).
 	if pageData.DataStatus&dbtypes.ElBlockDataCallTraces == 0 {
 		pageData.InternalTxsNotAvailable = true
 		return
@@ -1037,9 +1232,11 @@ func loadTransactionInternalTxsFromBlockdb(ctx context.Context, pageData *models
 		}
 	}
 
-	// Fallback: load from DB index (only when blockdb is unavailable)
-	entries, _ := db.GetElTransactionsInternalByTxUid(ctx, txUid)
-	loadTransactionInternalTxsFromDB(ctx, pageData, entries)
+	// No per-call detail in the DB index (it stores per-account aggregates),
+	// so when blockdb is unavailable we have nothing to render. Surface the
+	// "not available" state so the template shows the archive notice.
+	_ = txUid
+	pageData.InternalTxsNotAvailable = true
 }
 
 // buildInternalTxsFromBlockdb converts decoded blockdb call frames to page
@@ -1144,63 +1341,6 @@ func buildInternalTxsFromBlockdb(ctx context.Context, pageData *models.Transacti
 					}
 				}
 			}
-		}
-
-		pageData.InternalTxs = append(pageData.InternalTxs, itx)
-	}
-}
-
-// loadTransactionInternalTxsFromDB populates internal transactions from DB data
-// only (no depth/input/output trace data).
-func loadTransactionInternalTxsFromDB(ctx context.Context, pageData *models.TransactionPageData, entries []*dbtypes.ElTransactionInternal) {
-	if len(entries) == 0 {
-		return
-	}
-
-	// Collect account IDs for batch lookup
-	accountIDs := make(map[uint64]bool, len(entries)*2)
-	for _, e := range entries {
-		accountIDs[e.FromID] = true
-		accountIDs[e.ToID] = true
-	}
-
-	// Batch lookup accounts
-	accountIDList := make([]uint64, 0, len(accountIDs))
-	for id := range accountIDs {
-		accountIDList = append(accountIDList, id)
-	}
-	accountMap := make(map[uint64]*dbtypes.ElAccount, len(accountIDList))
-	if len(accountIDList) > 0 {
-		if accounts, err := db.GetElAccountsByIDs(ctx, accountIDList); err == nil {
-			for _, a := range accounts {
-				accountMap[a.ID] = a
-			}
-		}
-	}
-
-	// Build internal tx list
-	pageData.InternalTxs = make([]*models.TransactionPageDataInternalTx, 0, len(entries))
-	for _, e := range entries {
-		itx := &models.TransactionPageDataInternalTx{
-			CallIndex: e.TxCallIdx,
-			CallType:  e.CallType,
-			Amount:    e.Value,
-			AmountRaw: e.ValueRaw,
-		}
-
-		if name, ok := callTypeNames[e.CallType]; ok {
-			itx.TypeName = name
-		} else {
-			itx.TypeName = fmt.Sprintf("TYPE_%d", e.CallType)
-		}
-
-		if from, ok := accountMap[e.FromID]; ok {
-			itx.FromAddr = from.Address
-			itx.FromIsContract = from.IsContract
-		}
-		if to, ok := accountMap[e.ToID]; ok {
-			itx.ToAddr = to.Address
-			itx.ToIsContract = to.IsContract
 		}
 
 		pageData.InternalTxs = append(pageData.InternalTxs, itx)
@@ -1365,6 +1505,12 @@ func loadFullTransactionData(ctx context.Context, pageData *models.TransactionPa
 
 	// Set input data from parsed transaction
 	pageData.InputData = ethTx.Data()
+	applyCalldataCosts(pageData)
+
+	// EIP-7976: calldata floor gas = 21000 + 64 × len(calldata)
+	if len(pageData.InputData) > 0 {
+		pageData.CalldataFloorGas = 21000 + uint64(len(pageData.InputData))*64
+	}
 
 	// Generate JSON using proper marshaling
 	generateTxJSON(pageData, &ethTx)
@@ -1377,6 +1523,11 @@ func loadFullTransactionData(ctx context.Context, pageData *models.TransactionPa
 	// Load authorization data for type 4 (EIP-7702) transactions
 	if ethTx.Type() == ethtypes.SetCodeTxType {
 		loadAuthorizationData(pageData, &ethTx)
+	}
+
+	// Load access list data for type 1 (EIP-2930) transactions
+	if ethTx.Type() == ethtypes.AccessListTxType {
+		loadAccessListData(pageData, &ethTx)
 	}
 }
 
@@ -1392,7 +1543,7 @@ func loadBlobData(pageData *models.TransactionPageData, ethTx *ethtypes.Transact
 	// Get KZG commitments from beacon block
 	var kzgCommitments [][]byte
 	if blockData != nil && blockData.Block != nil && blockData.Block.Message != nil && blockData.Block.Message.Body != nil {
-		commitments := blockData.Block.Message.Body.BlobKZGCommitments
+		commitments := utils.BlockBodyBlobCommitments(blockData.Block.Message.Body)
 		// Find the commitments that correspond to this transaction's blobs
 		// by matching versioned hashes
 		kzgCommitments = utils.MatchBlobCommitments(blobHashes, commitments)
@@ -1486,6 +1637,35 @@ func applyCallTargetResolution(ctx context.Context, pageData *models.Transaction
 	}
 }
 
+// applyCalldataCosts computes calldata gas cost fields from pageData.InputData.
+// Covers three pricing regimes: pre-Prague standard, EIP-7623 (Prague floor), EIP-7976 (Amsterdam floor).
+// Must be called after InputData is set.
+func applyCalldataCosts(pageData *models.TransactionPageData) {
+	data := pageData.InputData
+	if len(data) == 0 {
+		return
+	}
+	z := 0
+	for _, b := range data {
+		if b == 0 {
+			z++
+		}
+	}
+	nz := len(data) - z
+	total := uint64(len(data))
+
+	tokens := nz*4 + z
+	pageData.CalldataZeroBytes = z
+	pageData.CalldataNonZeroBytes = nz
+	pageData.CalldataPragueTokens = tokens
+	// Standard intrinsic (pre-Prague): TX_BASE + 4×zero + 16×nonzero
+	pageData.CalldataStandardGas = 21000 + uint64(z)*4 + uint64(nz)*16
+	// EIP-7623 floor (Prague+): tokens = 4×nonzero + zero; floor = TX_BASE + tokens×10
+	pageData.CalldataPragueFloor = 21000 + uint64(tokens)*10
+	// EIP-7976 floor (Amsterdam+): flat 64 gas per byte regardless of zero/nonzero
+	pageData.CalldataAmsterdamFloor = 21000 + total*64
+}
+
 // loadAuthorizationData extracts EIP-7702 authorization list entries from a
 // parsed transaction and populates pageData.Authorizations.
 func loadAuthorizationData(
@@ -1516,6 +1696,39 @@ func loadAuthorizationData(
 
 		pageData.Authorizations[i] = entry
 	}
+}
+
+// loadAccessListData extracts EIP-2930 access list entries from a parsed
+// transaction and populates pageData.AccessListEntries and
+// pageData.AccessListStorageKeys.
+func loadAccessListData(
+	pageData *models.TransactionPageData,
+	ethTx *ethtypes.Transaction,
+) {
+	al := ethTx.AccessList()
+	if len(al) == 0 {
+		return
+	}
+
+	pageData.AccessListEntries = make([]models.TransactionAccessListEntry, len(al))
+	for i, entry := range al {
+		keys := make([][]byte, len(entry.StorageKeys))
+		for j, k := range entry.StorageKeys {
+			keyCopy := k // common.Hash is [32]byte
+			keys[j] = keyCopy[:]
+		}
+		pageData.AccessListEntries[i] = models.TransactionAccessListEntry{
+			Address:     entry.Address.Bytes(),
+			StorageKeys: keys,
+		}
+		pageData.AccessListStorageKeys += uint64(len(entry.StorageKeys))
+	}
+
+	// EIP-7981 (Amsterdam): ACCESS_LIST_STORAGE_KEY_COST 2400→1900, address cost unchanged at 2400
+	addrs := uint64(len(al))
+	pageData.AccessListGasAmsterdam = addrs*2400 + pageData.AccessListStorageKeys*1900
+	pageData.AccessListGasPrague = addrs*2400 + pageData.AccessListStorageKeys*2400
+	pageData.AccessListGasSavings = pageData.AccessListGasPrague - pageData.AccessListGasAmsterdam
 }
 
 // resolveAuthorizationValidity loads state diffs from blockdb and checks

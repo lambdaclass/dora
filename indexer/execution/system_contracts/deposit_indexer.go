@@ -70,11 +70,13 @@ func NewDepositIndexer(indexer *execution.IndexerCtx) *DepositIndexer {
 		indexer,
 		ds.logger.WithField("routine", "crawler"),
 		&contractIndexerOptions[dbtypes.DepositTx]{
-			stateKey:        "indexer.depositstate",
-			batchSize:       batchSize,
-			contractAddress: common.Address(specs.DepositContractAddress),
-			deployBlock:     uint64(utils.Config.ExecutionApi.DepositDeployBlock),
-			dequeueRate:     0,
+			stateKey:  "indexer.depositstate",
+			batchSize: batchSize,
+			contractAddress: func() common.Address {
+				return common.Address(specs.DepositContractAddress)
+			},
+			deployBlock: uint64(utils.Config.ExecutionApi.DepositDeployBlock),
+			dequeueRate: 0,
 
 			processFinalTx:  ds.processFinalTx,
 			processRecentTx: ds.processRecentTx,
@@ -110,7 +112,7 @@ func (ci *DepositIndexer) processFinalTx(log *types.Log, tx *types.Transaction, 
 		return nil, fmt.Errorf("invalid deposit log")
 	}
 
-	txTo := *tx.To()
+	txTo := txRecipient(tx, log)
 
 	requestTx.BlockTime = header.Time
 	requestTx.TxSender = txFrom[:]
@@ -133,7 +135,7 @@ func (ci *DepositIndexer) processRecentTx(log *types.Log, tx *types.Transaction,
 		return nil, fmt.Errorf("invalid deposit log")
 	}
 
-	txTo := *tx.To()
+	txTo := txRecipient(tx, log)
 
 	requestTx.BlockTime = header.Time
 	requestTx.TxSender = txFrom[:]

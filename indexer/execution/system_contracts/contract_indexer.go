@@ -31,11 +31,11 @@ type contractIndexer[TxType any] struct {
 
 // contractIndexerOptions defines the configuration for the contract indexer
 type contractIndexerOptions[TxType any] struct {
-	stateKey        string         // key to identify the indexer state in the database
-	batchSize       int            // number of logs to fetch per request
-	contractAddress common.Address // address of the contract to index
-	deployBlock     uint64         // block number from where to start crawling logs
-	dequeueRate     uint64         // number of logs to dequeue per block, 0 for no queue
+	stateKey        string                // key to identify the indexer state in the database
+	batchSize       int                   // number of logs to fetch per request
+	contractAddress func() common.Address // resolves the address of the contract to index (re-evaluated per scan, as client configs may arrive after startup)
+	deployBlock     uint64                // block number from where to start crawling logs
+	dequeueRate     uint64                // number of logs to dequeue per block, 0 for no queue
 
 	// processFinalTx processes a finalized transaction log
 	processFinalTx func(log *types.Log, tx *types.Transaction, header *types.Header, txFrom common.Address, dequeueBlock uint64, parentTxs []*TxType) (*TxType, error)
@@ -173,6 +173,16 @@ func (ci *contractIndexer[_]) loadTransactionByHash(ctx context.Context, client 
 	return tx, err
 }
 
+// txRecipient returns the transaction recipient. Contract-creation transactions
+// have no recipient (To is nil); for those the request reached the system contract
+// via an internal call, so the emitting contract address is the effective target.
+func txRecipient(tx *types.Transaction, log *types.Log) common.Address {
+	if to := tx.To(); to != nil {
+		return *to
+	}
+	return log.Address
+}
+
 // loadHeaderByHash fetches a block header by its hash from the execution client
 func (ci *contractIndexer[_]) loadHeaderByHash(ctx context.Context, client *execution.Client, hash common.Hash) (*types.Header, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -217,8 +227,12 @@ func (ci *contractIndexer[TxType]) processFinalizedBlocks(finalizedBlockNumber u
 			FromBlock: big.NewInt(0).SetUint64(ci.state.FinalBlock + 1),
 			ToBlock:   big.NewInt(0).SetUint64(toBlock),
 			Addresses: []common.Address{
-				ci.options.contractAddress,
+				ci.options.contractAddress(),
 			},
+			// Match any topic. A nil Topics serializes to "topics": null, which some
+			// execution clients (e.g. ethrex) reject as a missing parameter; a non-nil
+			// empty slice serializes to "topics": [] and is accepted everywhere.
+			Topics: [][]common.Hash{},
 		}
 
 		logs, err := ci.loadFilteredLogs(ctx, client, query)
@@ -448,8 +462,12 @@ func (ci *contractIndexer[TxType]) processRecentBlocksForFork(headFork *exectx.F
 				FromBlock: big.NewInt(0).SetUint64(startBlockNumber),
 				ToBlock:   big.NewInt(0).SetUint64(toBlock),
 				Addresses: []common.Address{
-					ci.options.contractAddress,
+					ci.options.contractAddress(),
 				},
+				// Match any topic. A nil Topics serializes to "topics": null, which some
+				// execution clients (e.g. ethrex) reject as a missing parameter; a non-nil
+				// empty slice serializes to "topics": [] and is accepted everywhere.
+				Topics: [][]common.Hash{},
 			}
 
 			logs, reqError = ci.loadFilteredLogs(ctx, client, query)

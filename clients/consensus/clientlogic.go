@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"runtime/debug"
 	"time"
 
 	v1 "github.com/ethpandaops/go-eth2-client/api/v1"
@@ -13,17 +12,13 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/ethpandaops/dora/clients/consensus/rpc"
+	"github.com/ethpandaops/dora/utils"
 )
 
 func (client *Client) runClientLoop() {
-	defer func() {
-		if err := recover(); err != nil {
-			client.logger.WithError(err.(error)).Errorf("uncaught panic in clients.consensus.Client.runClientLoop subroutine: %v, stack: %v", err, string(debug.Stack()))
-			time.Sleep(10 * time.Second)
-
-			go client.runClientLoop()
-		}
-	}()
+	defer utils.HandleSubroutinePanic("clients.consensus.Client.runClientLoop", func() {
+		client.runClientLoop()
+	})
 
 	for {
 		err := client.checkClient()
@@ -135,6 +130,12 @@ func (client *Client) buildEventStreamMask() uint16 {
 		events |= rpc.StreamInclusionListEvent
 	}
 
+	// fast confirmation is an optional node feature. nodes reject the whole
+	// subscription with a HTTP 400 for unknown topics, so the topic is requested
+	// via a separate SSE stream that silently gives up on rejection instead of
+	// being mixed into the main block/head/finalized stream
+	events |= rpc.StreamFastConfirmationEvent
+
 	return events
 }
 
@@ -196,6 +197,9 @@ func (client *Client) runClientLogic() error {
 
 			case rpc.StreamInclusionListEvent:
 				client.inclusionListDispatcher.Fire(evt.Data.(*v1.InclusionListEvent))
+
+			case rpc.StreamFastConfirmationEvent:
+				client.processFastConfirmationEvent(evt.Data.(*rpc.FastConfirmationEvent))
 			}
 
 			// fire through stream dispatcher first to preserve SSE ordering
@@ -366,6 +370,17 @@ func (client *Client) processHeadEvent(evt *v1.HeadEvent) error {
 	client.headMutex.Unlock()
 
 	return nil
+}
+
+func (client *Client) processFastConfirmationEvent(evt *rpc.FastConfirmationEvent) {
+	client.headMutex.Lock()
+	client.fastConfirmedSlot = evt.Slot
+	client.fastConfirmedRoot = evt.Block
+	client.lastFastConfirmation = time.Now()
+	client.headMutex.Unlock()
+
+	client.pool.chainState.setFastConfirmedBlock(evt.Slot, evt.Block)
+	client.fastConfirmationDispatcher.Fire(evt)
 }
 
 func (client *Client) processFinalizedEvent(evt *v1.FinalizedCheckpointEvent) error {

@@ -70,6 +70,7 @@ type BlockBodyIndex struct {
 	EthTransactionCount uint64
 	BlobCount           uint64
 	BuilderIndex        uint64
+	BidValue            uint64 // bid value in Gwei (0 for self-builds and pre-gloas blocks)
 	GasUsed             uint64
 	GasLimit            uint64
 	BlockSize           uint64
@@ -419,6 +420,10 @@ func (block *Block) setBlockIndex(body *all.SignedBeaconBlock, payload *all.Sign
 		return
 	}
 
+	if payload == nil && block.executionPayload != nil {
+		payload = block.executionPayload
+	}
+
 	blockIndex := block.blockIndex
 	if blockIndex == nil {
 		blockIndex = &BlockBodyIndex{}
@@ -426,7 +431,7 @@ func (block *Block) setBlockIndex(body *all.SignedBeaconBlock, payload *all.Sign
 
 	bbody := body.Message.Body
 	blockIndex.Graffiti = bbody.Graffiti
-	blockIndex.BlobCount = uint64(len(bbody.BlobKZGCommitments))
+	blockIndex.BlobCount = uint64(len(utils.BlockBodyBlobCommitments(bbody)))
 
 	if extra, err := getBlockExecutionExtraData(body); err == nil {
 		blockIndex.ExecutionExtraData = extra
@@ -438,23 +443,26 @@ func (block *Block) setBlockIndex(body *all.SignedBeaconBlock, payload *all.Sign
 		blockIndex.BuilderIndex = math.MaxUint64
 	}
 
+	if bidValue, err := getBlockPayloadBidValue(body); err == nil {
+		blockIndex.BidValue = uint64(bidValue)
+	}
+
 	if parentHash, err := getBlockExecutionParentHash(body); err == nil {
 		blockIndex.ExecutionParentHash = parentHash
 	}
 
-	// Pre-EIP-7732: in-block execution payload carries hash, number,
-	// transaction count, gas accounting.
+	if blockHash, err := getBlockExecutionBlockHash(body); err == nil {
+		blockIndex.ExecutionHash = blockHash
+	}
+
 	if bbody.ExecutionPayload != nil {
 		ep := bbody.ExecutionPayload
-		blockIndex.ExecutionHash = ep.BlockHash
 		blockIndex.ExecutionNumber = ep.BlockNumber
 		blockIndex.EthTransactionCount = uint64(len(ep.Transactions))
 		blockIndex.GasUsed = ep.GasUsed
 		blockIndex.GasLimit = ep.GasLimit
 	}
 
-	// EIP-7732+: when the payload envelope is delivered separately,
-	// populate the execution accounting fields from it.
 	if payload != nil && payload.Message != nil && payload.Message.Payload != nil {
 		blockIndex.ExecutionHash = payload.Message.Payload.BlockHash
 		blockIndex.ExecutionNumber = payload.Message.Payload.BlockNumber
@@ -462,6 +470,7 @@ func (block *Block) setBlockIndex(body *all.SignedBeaconBlock, payload *all.Sign
 		blockIndex.EthTransactionCount = uint64(len(payload.Message.Payload.Transactions))
 		blockIndex.GasUsed = payload.Message.Payload.GasUsed
 		blockIndex.GasLimit = payload.Message.Payload.GasLimit
+		blockIndex.ExecutionExtraData = payload.Message.Payload.ExtraData
 	}
 
 	if blockSize, err := getBlockSize(block.dynSsz, body); err == nil {
@@ -670,7 +679,20 @@ func (block *Block) GetDbBlock(indexer *Indexer, isCanonical bool) *dbtypes.Slot
 		epochStats = indexer.epochCache.getEpochStats(chainState.EpochOfSlot(block.Slot), dependentBlock.Root)
 	}
 
-	dbBlock := indexer.dbWriter.buildDbBlock(block, epochStats, nil)
+	// Resolve the Gloas builder-payment quorum weight live for canonical blocks so the value shows
+	// on lists/detail before the slot is written to the db by finalization/pruning/sync. Epoch votes
+	// are cached, so this is cheap on repeat lookups within an epoch.
+	var payment *builderPaymentInfo
+	if isCanonical && epochStats != nil {
+		epoch := chainState.EpochOfSlot(block.Slot)
+		if chainState.IsEip7732Enabled(epoch) {
+			epochVotes := epochStats.GetEpochVotes(indexer, nil)
+			base := indexer.dbWriter.resolveBuilderPaymentBase(epoch, epochStats)
+			payment = indexer.dbWriter.builderPaymentForSlot(block.Slot, epochVotes, base)
+		}
+	}
+
+	dbBlock := indexer.dbWriter.buildDbBlock(block, epochStats, nil, payment)
 	if dbBlock == nil {
 		return nil
 	}
@@ -737,6 +759,24 @@ func (block *Block) GetDbConsolidationRequests(indexer *Indexer, isCanonical boo
 	}
 
 	return indexer.dbWriter.buildDbConsolidationRequests(block, !isCanonical, nil, nil)
+}
+
+// GetDbBuilderDeposits returns the database representation of the builder deposit requests in this block.
+func (block *Block) GetDbBuilderDeposits(indexer *Indexer, isCanonical bool) []*dbtypes.BuilderDeposit {
+	if block.isDisposed {
+		return nil
+	}
+
+	return indexer.dbWriter.buildDbBuilderDeposits(block, !isCanonical, nil)
+}
+
+// GetDbBuilderExits returns the database representation of the builder exit requests in this block.
+func (block *Block) GetDbBuilderExits(indexer *Indexer, isCanonical bool) []*dbtypes.BuilderExit {
+	if block.isDisposed {
+		return nil
+	}
+
+	return indexer.dbWriter.buildDbBuilderExits(block, !isCanonical, nil)
 }
 
 // GetForkId returns the fork ID of this block.

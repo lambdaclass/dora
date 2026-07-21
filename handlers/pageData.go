@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"syscall"
@@ -143,6 +145,25 @@ func createMenuItems(active string) []types.MainMenuItem {
 			*/
 		},
 	})
+	blockchainMenu = append(blockchainMenu, types.NavigationGroup{
+		Links: []types.NavigationLink{
+			{
+				Label: "Transactions",
+				Path:  "/transactions",
+				Icon:  "fa-right-left",
+			},
+			{
+				Label: "Transfers",
+				Path:  "/transfers",
+				Icon:  "fa-arrow-right-arrow-left",
+			},
+			{
+				Label: "Tokens",
+				Path:  "/tokens",
+				Icon:  "fa-coins",
+			},
+		},
+	})
 	if len(utils.Config.MevIndexer.Relays) > 0 {
 		blockchainMenu = append(blockchainMenu, types.NavigationGroup{
 			Links: []types.NavigationLink{
@@ -202,23 +223,15 @@ func createMenuItems(active string) []types.MainMenuItem {
 		Path:  "/validators/activity",
 		Icon:  "fa-tachometer",
 	})
+	validatorMenuLinks = append(validatorMenuLinks, types.NavigationLink{
+		Label: "Withdrawal Dashboard",
+		Path:  "/validators/withdrawal-dashboard",
+		Icon:  "fa-wallet",
+	})
 
 	validatorMenu = append(validatorMenu, types.NavigationGroup{
 		Links: validatorMenuLinks,
 	})
-
-	if specs != nil && specs.GloasForkEpoch != nil && uint64(chainState.CurrentEpoch()) >= *specs.GloasForkEpoch {
-		builderMenu := []types.NavigationLink{
-			{
-				Label: "Builders",
-				Path:  "/builders",
-				Icon:  "fa-building",
-			},
-		}
-		validatorMenu = append(validatorMenu, types.NavigationGroup{
-			Links: builderMenu,
-		})
-	}
 
 	validatorActionsGroup := types.NavigationGroup{
 		Links: []types.NavigationLink{
@@ -290,7 +303,7 @@ func createMenuItems(active string) []types.MainMenuItem {
 		})
 	}
 
-	return []types.MainMenuItem{
+	mainMenu := []types.MainMenuItem{
 		{
 			Label:    "Blockchain",
 			IsActive: active == "blockchain",
@@ -301,12 +314,69 @@ func createMenuItems(active string) []types.MainMenuItem {
 			IsActive: active == "validators",
 			Groups:   validatorMenu,
 		},
-		{
-			Label:    "Clients",
-			IsActive: active == "clients",
-			Groups:   clientsMenu,
-		},
 	}
+
+	// Builders menu group (Gloas/EIP-8282): builders are tracked separately from validators.
+	// Shown as soon as Gloas is scheduled (a finite fork epoch), not only once it is active, so
+	// the builder deposits page can surface the projected early-onboarded builders ahead of the fork.
+	if specs != nil && specs.GloasForkEpoch != nil && *specs.GloasForkEpoch < math.MaxUint64 {
+		buildersMenu := []types.NavigationGroup{
+			{
+				Links: []types.NavigationLink{
+					{
+						Label: "Builders",
+						Path:  "/builders",
+						Icon:  "fa-building",
+					},
+					{
+						Label: "Deposits",
+						Path:  "/builders/deposits",
+						Icon:  "fa-file-signature",
+					},
+					{
+						Label: "Exits",
+						Path:  "/builders/exits",
+						Icon:  "fa-door-open",
+					},
+				},
+			},
+		}
+
+		builderSubmitLinks := []types.NavigationLink{}
+		if utils.Config.Frontend.ShowSubmitDeposit {
+			builderSubmitLinks = append(builderSubmitLinks, types.NavigationLink{
+				Label: "Submit Deposit",
+				Path:  "/builders/submit_deposit",
+				Icon:  "fa-file-import",
+			})
+		}
+		if utils.Config.Frontend.ShowSubmitElRequests {
+			builderSubmitLinks = append(builderSubmitLinks, types.NavigationLink{
+				Label: "Submit Exit",
+				Path:  "/builders/submit_exit",
+				Icon:  "fa-door-open",
+			})
+		}
+		if len(builderSubmitLinks) > 0 {
+			buildersMenu = append(buildersMenu, types.NavigationGroup{
+				Links: builderSubmitLinks,
+			})
+		}
+
+		mainMenu = append(mainMenu, types.MainMenuItem{
+			Label:    "Builders",
+			IsActive: active == "builders",
+			Groups:   buildersMenu,
+		})
+	}
+
+	mainMenu = append(mainMenu, types.MainMenuItem{
+		Label:    "Clients",
+		IsActive: active == "clients",
+		Groups:   clientsMenu,
+	})
+
+	return mainMenu
 }
 
 // used to handle errors constructed by Template.ExecuteTemplate correctly
@@ -323,4 +393,31 @@ func handleTemplateError(w http.ResponseWriter, r *http.Request, fileIdentifier 
 		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 	}
 	return err
+}
+
+// resolveEnsNames resolves the primary ENS names for the given execution addresses via
+// the ENS resolver service. It returns an address->name map (empty when the resolver is
+// disabled) and enqueues unresolved/stale addresses for asynchronous resolution.
+//
+// Handlers call this once per page build with all addresses shown on the page; the
+// result is stored on the page model (models.EnsNameData) and rendered client-side.
+func resolveEnsNames(ctx context.Context, addrs [][]byte) map[string]string {
+	ensResolver := services.GlobalBeaconService.GetEnsResolver()
+	if ensResolver == nil {
+		return nil
+	}
+	return ensResolver.ResolveNames(ctx, addrs)
+}
+
+// appendEnsHexAddrs appends the 20-byte form of 0x-hex address strings to dst, skipping
+// empty or invalid entries. Used to include addresses that page models carry as hex
+// strings (e.g. the TxOrigin/TxTarget in tx-detail callouts) in the ENS resolve set.
+func appendEnsHexAddrs(dst [][]byte, hexAddrs ...string) [][]byte {
+	for _, hexAddr := range hexAddrs {
+		if hexAddr == "" || !common.IsHexAddress(hexAddr) {
+			continue
+		}
+		dst = append(dst, common.HexToAddress(hexAddr).Bytes())
+	}
+	return dst
 }

@@ -18,6 +18,9 @@ type IndexPageData struct {
 	CurrentSlot             uint64    `json:"cur_slot"`
 	CurrentScheduledCount   uint64    `json:"cur_scheduled"`
 	CurrentEpochProgress    float64   `json:"cur_epoch_prog"`
+	FcrEnabled              bool      `json:"fcr_enabled"`
+	SafeSlot                uint64    `json:"safe_slot"`
+	SafeRoot                []byte    `json:"safe_root" ssz-size:"32"`
 	ActiveValidatorCount    uint64    `json:"active_val"`
 	EnteringValidatorCount  uint64    `json:"entering_val"`
 	EnteringEtherAmount     uint64    `json:"entering_ether"`
@@ -65,6 +68,8 @@ type IndexPageDataEpochs struct {
 	BlockCount            uint64    `json:"blocks"`
 	SlotsPerEpoch         uint64    `json:"slots_per_epoch"`
 	ProposalParticipation float64   `json:"proposalp"`
+	PayloadCount          uint64    `json:"payloads"`
+	PayloadParticipation  float64   `json:"payloadp"`
 }
 
 type IndexPageDataBlocks struct {
@@ -90,6 +95,7 @@ type IndexPageDataSlots struct {
 	ProposerName  string                    `json:"proposer_name"`
 	Status        uint64                    `json:"status"`
 	PayloadStatus uint8                     `json:"payload_status"`
+	Safe          bool                      `json:"safe"`
 	BlockRoot     []byte                    `json:"block_root" ssz-size:"32"`
 	ParentRoot    []byte                    `json:"parent_root" ssz-size:"32"`
 	ForkGraph     []*IndexPageDataForkGraph `json:"fork_graph"`

@@ -137,6 +137,16 @@ func GetWithdrawalsFiltered(ctx context.Context, offset uint64, limit uint32, fi
 		fmt.Fprintf(&sql, " %v amount <= $%v", filterOp, len(args))
 		filterOp = "AND"
 	}
+	if filter.MinSlot != nil {
+		args = append(args, *filter.MinSlot)
+		fmt.Fprintf(&sql, " %v block_uid >> 16 >= $%v", filterOp, len(args))
+		filterOp = "AND"
+	}
+	if filter.MaxSlot != nil {
+		args = append(args, *filter.MaxSlot)
+		fmt.Fprintf(&sql, " %v block_uid >> 16 <= $%v", filterOp, len(args))
+		filterOp = "AND"
+	}
 	if filter.WithOrphaned == 0 {
 		args = append(args, finalizedBlock)
 		fmt.Fprintf(&sql, " %v (block_uid >> 16 > $%v OR orphaned = false)", filterOp, len(args))
@@ -147,12 +157,10 @@ func GetWithdrawalsFiltered(ctx context.Context, offset uint64, limit uint32, fi
 		filterOp = "AND"
 	}
 	if filter.ValidatorName != "" {
-		args = append(args, "%"+filter.ValidatorName+"%")
-		fmt.Fprintf(&sql, " %v ", filterOp)
-		fmt.Fprintf(&sql, EngineQuery(map[dbtypes.DBEngineType]string{
-			dbtypes.DBEnginePgsql:  ` validator_names.name ilike $%v `,
-			dbtypes.DBEngineSqlite: ` validator_names.name LIKE $%v `,
-		}), len(args))
+		var namePredicate string
+		namePredicate, args = AppendValidatorNameHistoryFilter(args, "withdrawals.validator", "(withdrawals.block_uid >> 16)", "",
+			"validator_names.name", "%"+filter.ValidatorName+"%", false)
+		fmt.Fprintf(&sql, " %v %v ", filterOp, namePredicate)
 		filterOp = "AND"
 	}
 

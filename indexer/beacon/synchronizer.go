@@ -356,7 +356,9 @@ func (s *synchronizer) syncEpoch(syncEpoch phase0.Epoch, client *Client, lastTry
 			canonicalBlocks = append(canonicalBlocks, s.cachedBlocks[slot])
 			canonicalBlockRoots = append(canonicalBlockRoots, s.cachedBlocks[slot].Root[:])
 			if blockIndex := s.cachedBlocks[slot].GetBlockIndex(s.indexer.ctx); blockIndex != nil {
-				canonicalBlockHashes = append(canonicalBlockHashes, blockIndex.ExecutionHash[:])
+				if !chainState.IsEip7732Enabled(chainState.EpochOfSlot(slot)) || s.cachedBlocks[slot].HasExecutionPayload() {
+					canonicalBlockHashes = append(canonicalBlockHashes, blockIndex.ExecutionHash[:])
+				}
 			}
 		} else {
 			nextEpochCanonicalBlocks = append(nextEpochCanonicalBlocks, s.cachedBlocks[slot])
@@ -427,8 +429,6 @@ func (s *synchronizer) syncEpoch(syncEpoch phase0.Epoch, client *Client, lastTry
 		sim.validatorSet = validatorSet
 	}
 
-	// Determine payload status for canonical blocks (ePBS only)
-	// A payload is orphaned if the next canonical block doesn't build on it
 	allCanonicalBlocks := append(canonicalBlocks, nextEpochCanonicalBlocks...)
 	for i, block := range canonicalBlocks {
 		if !chainState.IsEip7732Enabled(chainState.EpochOfSlot(block.Slot)) {
@@ -436,8 +436,8 @@ func (s *synchronizer) syncEpoch(syncEpoch phase0.Epoch, client *Client, lastTry
 		}
 
 		blockIndex := block.GetBlockIndex(s.indexer.ctx)
-		if blockIndex == nil || blockIndex.ExecutionNumber == 0 {
-			continue // no execution payload
+		if blockIndex == nil || bytes.Equal(blockIndex.ExecutionHash[:], zeroHash[:]) {
+			continue // no execution commitment
 		}
 
 		// Find the next canonical block
@@ -449,10 +449,7 @@ func (s *synchronizer) syncEpoch(syncEpoch phase0.Epoch, client *Client, lastTry
 		if nextBlock != nil {
 			nextBlockIndex := nextBlock.GetBlockIndex(s.indexer.ctx)
 			if nextBlockIndex != nil {
-				// Check if next block builds on this block's payload
-				if !bytes.Equal(nextBlockIndex.ExecutionParentHash[:], blockIndex.ExecutionHash[:]) {
-					block.isPayloadOrphaned = true
-				}
+				block.isPayloadOrphaned = !bytes.Equal(nextBlockIndex.ExecutionParentHash[:], blockIndex.ExecutionHash[:])
 			}
 		}
 	}
@@ -513,7 +510,27 @@ func (s *synchronizer) syncEpoch(syncEpoch phase0.Epoch, client *Client, lastTry
 				}
 			}(block)
 		}
+
+		// store the epoch's resolved duties alongside the block writes
+		var dutiesSize int64
+		wg.Add(1)
+		go func(values *EpochStatsValues) {
+			defer wg.Done()
+			size, err := s.indexer.writeEpochDutiesToBlockDb(s.indexer.ctx, syncEpoch, values)
+			if err != nil {
+				s.logger.Errorf("error writing epoch %v duties to blockdb: %v", syncEpoch, err)
+				return
+			}
+			dutiesSize = size
+		}(epochStatsValues)
+
 		wg.Wait()
+
+		if dutiesSize > 0 {
+			if err := db.UpdateEpochDutiesSize(s.indexer.ctx, uint64(syncEpoch), uint64(dutiesSize)); err != nil {
+				s.logger.Errorf("error updating epoch %v duties size: %v", syncEpoch, err)
+			}
+		}
 	}
 
 	// cleanup cache (remove blocks from this epoch)

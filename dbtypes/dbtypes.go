@@ -10,6 +10,27 @@ type ValidatorName struct {
 	Name  string `db:"name"`
 }
 
+// ValidatorNameSnapshot describes one historic validator name assignment period:
+// the range rows referencing it via snapshot_slot are valid for [StartSlot, EndSlot)
+// resp. [StartTime, EndTime). The last snapshot is open-ended (math.MaxInt64 bounds).
+type ValidatorNameSnapshot struct {
+	StartSlot  uint64 `db:"start_slot"`
+	EndSlot    uint64 `db:"end_slot"`
+	StartTime  uint64 `db:"start_time"`
+	EndTime    uint64 `db:"end_time"`
+	RangesHash string `db:"ranges_hash"`
+}
+
+// ValidatorNameRange assigns a name to the validator index range [StartIndex, EndIndex]
+// during the snapshot period identified by SnapshotSlot. Ranges within a snapshot are
+// disjoint, which allows point lookups via a single top-1 index descent.
+type ValidatorNameRange struct {
+	SnapshotSlot uint64 `db:"snapshot_slot"`
+	StartIndex   uint64 `db:"start_index"`
+	EndIndex     uint64 `db:"end_index"`
+	Name         string `db:"name"`
+}
+
 type SlotStatus uint8
 
 const (
@@ -69,7 +90,10 @@ type Slot struct {
 	ExecTimes             []byte        `db:"exec_times"`
 	PayloadStatus         PayloadStatus `db:"payload_status"`
 	BlockUid              uint64        `db:"block_uid"`
-	BuilderIndex          int64         `db:"builder_index"` // Builder index, -1 for self-built blocks (MaxUint64)
+	BuilderIndex          int64         `db:"builder_index"`           // Builder index, -1 for self-built blocks (MaxUint64)
+	EthBidValue           uint64        `db:"eth_bid_value"`           // Bid value in Gwei (0 for self-builds and pre-gloas blocks)
+	BuilderPaymentWeight  uint64        `db:"builder_payment_weight"`  // Gloas: same-slot attester balance backing the builder payment quorum (Gwei); 0 pre-gloas
+	BuilderPaymentPercent float32       `db:"builder_payment_percent"` // Gloas: BuilderPaymentWeight as % of the per-slot quorum base (total active balance / slots-per-epoch)
 }
 
 type Epoch struct {
@@ -78,6 +102,7 @@ type Epoch struct {
 	ValidatorBalance      uint64  `db:"validator_balance"`
 	Eligible              uint64  `db:"eligible"`
 	VotedTarget           uint64  `db:"voted_target"`
+	VotedTargetSlashed    uint64  `db:"voted_target_slashed"`
 	VotedHead             uint64  `db:"voted_head"`
 	VotedTotal            uint64  `db:"voted_total"`
 	BlockCount            uint16  `db:"block_count"`
@@ -155,6 +180,7 @@ type UnfinalizedEpoch struct {
 	ValidatorBalance      uint64  `db:"validator_balance"`
 	Eligible              uint64  `db:"eligible"`
 	VotedTarget           uint64  `db:"voted_target"`
+	VotedTargetSlashed    uint64  `db:"voted_target_slashed"`
 	VotedHead             uint64  `db:"voted_head"`
 	VotedTotal            uint64  `db:"voted_total"`
 	BlockCount            uint16  `db:"block_count"`
@@ -184,6 +210,7 @@ type OrphanedEpoch struct {
 	ValidatorBalance      uint64  `db:"validator_balance"`
 	Eligible              uint64  `db:"eligible"`
 	VotedTarget           uint64  `db:"voted_target"`
+	VotedTargetSlashed    uint64  `db:"voted_target_slashed"`
 	VotedHead             uint64  `db:"voted_head"`
 	VotedTotal            uint64  `db:"voted_total"`
 	BlockCount            uint16  `db:"block_count"`
@@ -289,6 +316,7 @@ type Deposit struct {
 	WithdrawalCredentials []byte  `db:"withdrawalcredentials"`
 	Amount                uint64  `db:"amount"`
 	ForkId                uint64  `db:"fork_id"`
+	CredType              uint8   `db:"cred_type"`
 }
 
 type DepositWithTx struct {
@@ -435,6 +463,99 @@ type WithdrawalRequestTx struct {
 	DequeueBlock    uint64  `db:"dequeue_block"`
 }
 
+const (
+	BuilderDepositRequestResultUnknown uint8 = 0
+	BuilderDepositRequestResultSuccess uint8 = 1
+
+	// builder registration outcomes
+	BuilderDepositRequestResultNewBuilder uint8 = 2
+	BuilderDepositRequestResultTopUp      uint8 = 3
+
+	// errors
+	BuilderDepositRequestResultInvalidSignature uint8 = 20
+)
+
+// BuilderDeposit is the consensus-layer view of a builder deposit request
+// (Gloas/EIP-8282), attributed to the slot that processes it.
+type BuilderDeposit struct {
+	SlotNumber            uint64  `db:"slot_number"`
+	SlotRoot              []byte  `db:"slot_root"`
+	SlotIndex             uint64  `db:"slot_index"`
+	Orphaned              bool    `db:"orphaned"`
+	ForkId                uint64  `db:"fork_id"`
+	PublicKey             []byte  `db:"public_key"`
+	WithdrawalCredentials []byte  `db:"withdrawal_credentials"`
+	Amount                uint64  `db:"amount"`
+	Signature             []byte  `db:"signature"`
+	BuilderIndex          *uint64 `db:"builder_index"`
+	TxHash                []byte  `db:"tx_hash"`
+	BlockNumber           uint64  `db:"block_number"`
+	Result                uint8   `db:"result"`
+}
+
+// BuilderDepositTx is the execution-layer view of a builder deposit request,
+// indexed from the builder deposit system contract.
+type BuilderDepositTx struct {
+	BlockNumber           uint64  `db:"block_number"`
+	BlockIndex            uint64  `db:"block_index"`
+	BlockTime             uint64  `db:"block_time"`
+	BlockRoot             []byte  `db:"block_root"`
+	ForkId                uint64  `db:"fork_id"`
+	PublicKey             []byte  `db:"public_key"`
+	WithdrawalCredentials []byte  `db:"withdrawal_credentials"`
+	Amount                uint64  `db:"amount"`
+	Signature             []byte  `db:"signature"`
+	BuilderIndex          *uint64 `db:"builder_index"`
+	TxHash                []byte  `db:"tx_hash"`
+	TxSender              []byte  `db:"tx_sender"`
+	TxTarget              []byte  `db:"tx_target"`
+	DequeueBlock          uint64  `db:"dequeue_block"`
+}
+
+const (
+	BuilderExitRequestResultUnknown uint8 = 0
+	BuilderExitRequestResultSuccess uint8 = 1
+
+	// errors
+	BuilderExitRequestResultBuilderNotFound      uint8 = 20
+	BuilderExitRequestResultNotActive            uint8 = 21
+	BuilderExitRequestResultInvalidSource        uint8 = 22
+	BuilderExitRequestResultHasPendingWithdrawal uint8 = 23
+)
+
+// BuilderExit is the consensus-layer view of a builder exit request
+// (Gloas/EIP-8282), attributed to the slot that processes it.
+type BuilderExit struct {
+	SlotNumber    uint64  `db:"slot_number"`
+	SlotRoot      []byte  `db:"slot_root"`
+	SlotIndex     uint64  `db:"slot_index"`
+	Orphaned      bool    `db:"orphaned"`
+	ForkId        uint64  `db:"fork_id"`
+	SourceAddress []byte  `db:"source_address"`
+	PublicKey     []byte  `db:"public_key"`
+	BuilderIndex  *uint64 `db:"builder_index"`
+	TxHash        []byte  `db:"tx_hash"`
+	BlockNumber   uint64  `db:"block_number"`
+	Result        uint8   `db:"result"`
+}
+
+// BuilderExitTx is the execution-layer view of a builder exit request, indexed
+// from the builder exit system contract.
+type BuilderExitTx struct {
+	BlockNumber   uint64  `db:"block_number"`
+	BlockIndex    uint64  `db:"block_index"`
+	BlockTime     uint64  `db:"block_time"`
+	BlockRoot     []byte  `db:"block_root"`
+	ForkId        uint64  `db:"fork_id"`
+	SourceAddress []byte  `db:"source_address"`
+	PublicKey     []byte  `db:"public_key"`
+	BuilderIndex  *uint64 `db:"builder_index"`
+	TxHash        []byte  `db:"tx_hash"`
+	TxSender      []byte  `db:"tx_sender"`
+	TxTarget      []byte  `db:"tx_target"`
+	DequeueBlock  uint64  `db:"dequeue_block"`
+}
+
 type Validator struct {
 	ValidatorIndex             uint64 `db:"validator_index"`
 	Pubkey                     []byte `db:"pubkey"`
@@ -445,6 +566,7 @@ type Validator struct {
 	ActivationEpoch            int64  `db:"activation_epoch"`
 	ExitEpoch                  int64  `db:"exit_epoch"`
 	WithdrawableEpoch          int64  `db:"withdrawable_epoch"`
+	CredType                   uint8  `db:"cred_type"`
 }
 
 // EL Explorer types
@@ -477,7 +599,7 @@ type ElTransaction struct {
 	FromID      uint64  `db:"from_id"`
 	ToID        uint64  `db:"to_id"`
 	Nonce       uint64  `db:"nonce"`
-	Reverted    bool    `db:"reverted"`
+	RevertID    uint32  `db:"revert_id"` // 0 = success, 1 = reverted/unknown, >=10 = el_revert_reason id
 	Amount      float64 `db:"amount"`
 	AmountRaw   []byte  `db:"amount_raw"`
 	MethodID    []byte  `db:"method_id"`
@@ -487,27 +609,62 @@ type ElTransaction struct {
 	TipPrice    float64 `db:"tip_price"` // maxPriorityFeePerGas (in Gwei)
 	BlobCount   uint32  `db:"blob_count"`
 	BlockNumber uint64  `db:"block_number"`
-	TxType      uint8   `db:"tx_type"`
+	TxType      uint8   `db:"tx_type"`       // EVM tx type in bits 0-6; create flag in bit 7 (see ElTxType* below)
 	EffGasPrice float64 `db:"eff_gas_price"` // Effective gas price actually paid (in Gwei)
+	EventCount  uint16  `db:"event_count"`   // number of logs emitted (badge count; full event data in blockdb)
 }
 
-// ElTransactionInternal is a lightweight index of internal calls from call traces.
+// Reserved revert_id values on el_transactions. 0 = success; 1-99 are fixed
+// sentinels for well-known errors; dynamic deduped reasons are assigned ids
+// >= RevertIDDynamicMin. Well-known EVM errors map to a reserved id (matched by
+// substring) instead of a dynamic reason row, bounding cardinality — their full
+// message is still visible in the internal-transactions (call trace) tab.
+const (
+	RevertIDSuccess        uint32 = 0   // not reverted
+	RevertIDUnknown        uint32 = 1   // reverted, reason unavailable (no trace)
+	RevertIDOutOfGas       uint32 = 2   // "out of gas"
+	RevertIDStackUnderflow uint32 = 3   // "stack underflow"
+	RevertIDInvalidOpcode  uint32 = 4   // "invalid opcode"
+	RevertIDDynamicMin     uint32 = 100 // first id assigned to a deduped reason
+)
+
+// ElRevertReason is one deduplicated transaction revert reason. reason_hash is
+// the first 16 bytes of sha256(reason); last_tx_uid is the highest tx_uid that
+// referenced it (drives orphan reclaim).
+type ElRevertReason struct {
+	ID         uint32 `db:"id"`
+	Reason     string `db:"reason"`
+	ReasonHash []byte `db:"reason_hash"`
+	LastTxUid  uint64 `db:"last_tx_uid"`
+}
+
+// ElTxHash is one entry of the long-lived tx-hash index: a 10-byte tx-hash
+// prefix mapped to its tx_uid. Backs by-hash lookups after el_transactions rows
+// are pruned; lives with the blockdb (details) retention.
+type ElTxHash struct {
+	Hash10 []byte `db:"hash10"`
+	TxUid  uint64 `db:"tx_uid"`
+}
+
+// el_transactions.tx_type packs a flag into the top bit so no extra column is
+// needed: the create flag is bit 7; the EVM tx type is everything below it.
+const (
+	ElTxTypeMask   uint8 = 0x7F // bits 0-6: EVM tx type
+	ElTxFlagCreate uint8 = 0x80 // bit 7: contract-creation tx (raw recipient was null)
+)
+
+// ElTransactionInternal is a per-account aggregate of internal calls within a
+// transaction. One row per (tx_uid, account_id) regardless of how many sub-
+// calls touched the account — keeps insert volume bounded for call-heavy txs.
 type ElTransactionInternal struct {
-	TxUid     uint64  `db:"tx_uid"`     // block_uid << 16 | tx_index
-	TxCallIdx uint32  `db:"tx_callidx"` // Depth-first traversal index (0=top-level, skipped)
-	CallType  uint8   `db:"call_type"`  // 0=CALL, 1=STATICCALL, 2=DELEGATECALL, 3=CREATE, 4=CREATE2, 5=SELFDESTRUCT
-	FromID    uint64  `db:"from_id"`
-	ToID      uint64  `db:"to_id"`
-	Value     float64 `db:"value"`
-	ValueRaw  []byte  `db:"value_raw"`
-}
-
-// ElEventIndex is a lightweight searchable index for events (full data in blockdb).
-type ElEventIndex struct {
-	TxUid      uint64 `db:"tx_uid"` // block_uid << 16 | tx_index
-	EventIndex uint32 `db:"event_index"`
-	SourceID   uint64 `db:"source_id"`
-	Topic1     []byte `db:"topic1"`
+	TxUid        uint64  `db:"tx_uid"`         // block_uid << 16 | tx_index
+	AccountID    uint64  `db:"account_id"`     // touched account (from, to, or both)
+	InCount      uint16  `db:"in_count"`       // calls where account = callee (clamped)
+	OutCount     uint16  `db:"out_count"`      // calls where account = caller (clamped)
+	CallTypeMask uint16  `db:"call_type_mask"` // bitmap of incoming call types (account = to-side): bit n = 1 << n
+	ValueIn      float64 `db:"value_in"`       // sum of value where account was callee (ETH)
+	ValueOut     float64 `db:"value_out"`      // sum of value where account was caller (ETH)
+	GasUsed      uint64  `db:"gas_used"`       // sum of gas_used across calls involving the account
 }
 
 type ElAccount struct {
@@ -518,6 +675,14 @@ type ElAccount struct {
 	IsContract   bool   `db:"is_contract"`
 	LastNonce    uint64 `db:"last_nonce"`
 	LastBlockUid uint64 `db:"last_block_uid"`
+}
+
+// EnsName holds a resolved primary ENS name for an execution address.
+// An empty Name is a persisted negative result (address has no primary name).
+type EnsName struct {
+	Address      []byte `db:"address"`
+	Name         string `db:"name"`
+	ResolvedTime int64  `db:"resolved_time"`
 }
 
 // Token type constants
@@ -596,6 +761,7 @@ const (
 	WithdrawalTypeBuilderFullWithdrawal = 4 // Builder sweep (full balance withdrawal)
 	WithdrawalTypeBuilderPayment        = 5 // Builder direct payment (payload delivered)
 	WithdrawalTypeBuilderDelayedPayment = 6 // Builder delayed/quorum payment (missed payload)
+	WithdrawalTypeBuilderUnknownPayment = 7 // Builder unknown payment (dora tracking is not accurate under terrible network conditions)
 )
 
 type Withdrawal struct {

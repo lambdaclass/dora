@@ -78,6 +78,14 @@ type ChainSpecConfig struct {
 	ReorgHeadWeightThreshold        uint64 `yaml:"REORG_HEAD_WEIGHT_THRESHOLD"`
 	ReorgParentWeightThreshold      uint64 `yaml:"REORG_PARENT_WEIGHT_THRESHOLD"`
 	ReorgMaxEpochsSinceFinalization uint64 `yaml:"REORG_MAX_EPOCHS_SINCE_FINALIZATION"`
+	ProposerReorgCutoffBps          uint64 `yaml:"PROPOSER_REORG_CUTOFF_BPS"`
+	ConfirmationByzantineThreshold  uint64 `yaml:"CONFIRMATION_BYZANTINE_THRESHOLD"`
+
+	// Validator timing
+	AggregateDueBps    uint64 `yaml:"AGGREGATE_DUE_BPS"`
+	AttestationDueBps  uint64 `yaml:"ATTESTATION_DUE_BPS"`
+	ContributionDueBps uint64 `yaml:"CONTRIBUTION_DUE_BPS"`
+	SyncMessageDueBps  uint64 `yaml:"SYNC_MESSAGE_DUE_BPS"`
 
 	// Deposit contract
 	DepositChainId         uint64 `yaml:"DEPOSIT_CHAIN_ID"`
@@ -123,6 +131,13 @@ type ChainSpecConfig struct {
 	ChurnLimitQuotientGloas              uint64 `yaml:"CHURN_LIMIT_QUOTIENT_GLOAS"                 check-if-fork:"GloasForkEpoch"`
 	ConsolidationChurnLimitQuotient      uint64 `yaml:"CONSOLIDATION_CHURN_LIMIT_QUOTIENT"         check-if-fork:"GloasForkEpoch"`
 	MaxPerEpochActivationChurnLimitGloas uint64 `yaml:"MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS" check-if-fork:"GloasForkEpoch"`
+	AggregateDueBpsGloas                 uint64 `yaml:"AGGREGATE_DUE_BPS_GLOAS"                    check-if-fork:"GloasForkEpoch"`
+	AttestationDueBpsGloas               uint64 `yaml:"ATTESTATION_DUE_BPS_GLOAS"                  check-if-fork:"GloasForkEpoch"`
+	ContributionDueBpsGloas              uint64 `yaml:"CONTRIBUTION_DUE_BPS_GLOAS"                 check-if-fork:"GloasForkEpoch"`
+	SyncMessageDueBpsGloas               uint64 `yaml:"SYNC_MESSAGE_DUE_BPS_GLOAS"                 check-if-fork:"GloasForkEpoch"`
+	PayloadAttestationDueBps             uint64 `yaml:"PAYLOAD_ATTESTATION_DUE_BPS"                check-if-fork:"GloasForkEpoch"`
+	PayloadDueBps                        uint64 `yaml:"PAYLOAD_DUE_BPS"                            check-if-fork:"GloasForkEpoch"`
+	MaxRequestPayloads                   uint64 `yaml:"MAX_REQUEST_PAYLOADS"                       check-if-fork:"GloasForkEpoch"`
 
 	// Heze
 	InclusionListDueBPS uint64 `yaml:"INCLUSION_LIST_DUE_BPS" check-if-fork:"HezeForkEpoch"`
@@ -215,11 +230,16 @@ type ChainSpecPreset struct {
 	NumberOfColumns                   *uint64 `yaml:"NUMBER_OF_COLUMNS" check-if-fork:"FuluForkEpoch"`
 
 	// Gloas
-	PtcSize                        uint64 `yaml:"PTC_SIZE" check-if-fork:"GloasForkEpoch"`
-	MaxPayloadAttestations         uint64 `yaml:"MAX_PAYLOAD_ATTESTATIONS" check-if-fork:"GloasForkEpoch"`
-	BuilderRegistryLimit           uint64 `yaml:"BUILDER_REGISTRY_LIMIT" check-if-fork:"GloasForkEpoch"`
-	BuilderPendingWithdrawalsLimit uint64 `yaml:"BUILDER_PENDING_WITHDRAWALS_LIMIT" check-if-fork:"GloasForkEpoch"`
-	MaxBuildersPerWithdrawalsSweep uint64 `yaml:"MAX_BUILDERS_PER_WITHDRAWALS_SWEEP" check-if-fork:"GloasForkEpoch"`
+	PtcSize                             uint64 `yaml:"PTC_SIZE" check-if-fork:"GloasForkEpoch"`
+	MaxPayloadAttestations              uint64 `yaml:"MAX_PAYLOAD_ATTESTATIONS" check-if-fork:"GloasForkEpoch"`
+	MaxBuildersPerWithdrawalsSweep      uint64 `yaml:"MAX_BUILDERS_PER_WITHDRAWALS_SWEEP" check-if-fork:"GloasForkEpoch"`
+	MaxBuilderDepositRequestsPerPayload uint64 `yaml:"MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD" check-if-fork:"GloasForkEpoch"`
+	MaxBuilderExitRequestsPerPayload    uint64 `yaml:"MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD" check-if-fork:"GloasForkEpoch"`
+	MaxSignedAggregateAndProofSize      uint64 `yaml:"MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE" check-if-fork:"GloasForkEpoch"`
+	MaxAttesterSlashingSize             uint64 `yaml:"MAX_ATTESTER_SLASHING_SIZE" check-if-fork:"GloasForkEpoch"`
+	MaxDataColumnSidecarSize            uint64 `yaml:"MAX_DATA_COLUMN_SIDECAR_SIZE" check-if-fork:"GloasForkEpoch"`
+	MaxPartialDataColumnSidecarSize     uint64 `yaml:"MAX_PARTIAL_DATA_COLUMN_SIDECAR_SIZE" check-if-fork:"GloasForkEpoch"`
+	MaxSignedExecutionPayloadBidSize    uint64 `yaml:"MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE" check-if-fork:"GloasForkEpoch"`
 
 	// Heze
 	InclusionListCommitteeSize uint64 `yaml:"INCLUSION_LIST_COMMITTEE_SIZE" check-if-fork:"HezeForkEpoch"`
@@ -240,6 +260,7 @@ type ChainSpecDomainTypes struct {
 	DomainBeaconBuilder               phase0.DomainType `yaml:"DOMAIN_BEACON_BUILDER" check-if-fork:"GloasForkEpoch"`
 	DomainPtcAttester                 phase0.DomainType `yaml:"DOMAIN_PTC_ATTESTER" check-if-fork:"GloasForkEpoch"`
 	DomainProposerPreferences         phase0.DomainType `yaml:"DOMAIN_PROPOSER_PREFERENCES" check-if-fork:"GloasForkEpoch"`
+	DomainBuilderDeposit              phase0.DomainType `yaml:"DOMAIN_BUILDER_DEPOSIT" check-if-fork:"GloasForkEpoch"`
 }
 
 type ChainSpec struct {

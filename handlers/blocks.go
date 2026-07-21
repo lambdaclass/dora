@@ -15,6 +15,7 @@ import (
 	"github.com/ethpandaops/dora/db"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/indexer/beacon"
+	"github.com/ethpandaops/dora/indexer/beacon/statetransition"
 	"github.com/ethpandaops/dora/services"
 	"github.com/ethpandaops/dora/templates"
 	"github.com/ethpandaops/dora/types/models"
@@ -94,6 +95,8 @@ func buildBlocksPageData(ctx context.Context, firstSlot uint64, pageSize uint64,
 		}
 	}
 	if len(displayMap) == 0 {
+		cs := services.GlobalBeaconService.GetChainState()
+		gloasActive := cs.IsEip7732Enabled(cs.EpochOfSlot(cs.CurrentSlot()))
 		displayMap = map[uint64]bool{
 			1:  true,
 			2:  true,
@@ -110,11 +113,12 @@ func buildBlocksPageData(ctx context.Context, firstSlot uint64, pageSize uint64,
 			13: true,
 			14: true,
 			15: true,
-			16: true,
+			16: !gloasActive, // MEV Block (replaced by Builder once gloas is active)
 			17: true,
 			18: false,
 			19: false,
-			20: false, // Builder (hidden by default)
+			20: gloasActive, // Builder (shown once gloas is active)
+			21: false,       // Builder Payment quorum (opt-in; Gloas only)
 		}
 	}
 
@@ -150,6 +154,8 @@ func buildBlocksPageData(ctx context.Context, firstSlot uint64, pageSize uint64,
 	pageData.DisplayRecvDelay = displayMap[18]
 	pageData.DisplayExecTime = displayMap[19]
 	pageData.DisplayBuilder = displayMap[20]
+	pageData.DisplayBuilderPayment = displayMap[21]
+	pageData.BuilderPaymentQuorum = statetransition.BuilderPaymentQuorumPercent
 	pageData.DisplayColCount = uint64(len(displayMap))
 
 	chainState := services.GlobalBeaconService.GetChainState()
@@ -213,6 +219,9 @@ func buildBlocksPageData(ctx context.Context, firstSlot uint64, pageSize uint64,
 	// Get slot assignments
 	firstEpoch := chainState.EpochOfSlot(phase0.Slot(firstSlot))
 
+	safeSlot, _, lastFastConfirmation := chainState.GetFastConfirmedBlock()
+	fcrEnabled := !lastFastConfirmation.IsZero()
+
 	// load blocks
 	pageData.Blocks = make([]*models.BlocksPageDataSlot, 0)
 	dbBlocks := services.GlobalBeaconService.GetDbBlocksForSlots(ctx, firstSlot, uint32(pageSize), false, true)
@@ -252,16 +261,24 @@ func buildBlocksPageData(ctx context.Context, firstSlot uint64, pageSize uint64,
 			dbSlot := dbBlocks[dbIdx]
 			dbIdx++
 
+			epoch := chainState.EpochOfSlot(phase0.Slot(slot))
+			payloadStatus := dbSlot.PayloadStatus
+			if !chainState.IsEip7732Enabled(phase0.Epoch(epoch)) {
+				payloadStatus = dbtypes.PayloadStatusCanonical
+			}
+
 			slotData := &models.BlocksPageDataSlot{
 				Slot:                  slot,
-				Epoch:                 uint64(chainState.EpochOfSlot(phase0.Slot(slot))),
+				Epoch:                 uint64(epoch),
 				Ts:                    chainState.SlotToTime(phase0.Slot(slot)),
 				Finalized:             finalized,
 				Status:                uint8(dbSlot.Status),
+				PayloadStatus:         uint8(payloadStatus),
+				Safe:                  fcrEnabled && dbSlot.Status == dbtypes.Canonical && slot <= uint64(safeSlot),
 				Scheduled:             slot >= uint64(currentSlot) && dbSlot.Status == dbtypes.Missing,
 				Synchronized:          dbSlot.SyncParticipation != -1,
 				Proposer:              dbSlot.Proposer,
-				ProposerName:          services.GlobalBeaconService.GetValidatorName(dbSlot.Proposer),
+				ProposerName:          services.GlobalBeaconService.GetValidatorNameAt(dbSlot.Proposer, phase0.Slot(dbSlot.Slot)),
 				AttestationCount:      dbSlot.AttestationCount,
 				DepositCount:          dbSlot.DepositCount,
 				ExitCount:             dbSlot.ExitCount,
@@ -300,8 +317,9 @@ func buildBlocksPageData(ctx context.Context, firstSlot uint64, pageSize uint64,
 				}
 			}
 
-			// Add builder info
-			if pageData.DisplayBuilder {
+			// Add builder info (needed for the Builder column and the proposer build-source icon).
+			// Only blocks that actually exist (proposed or orphaned) carry a build source.
+			if (pageData.DisplayBuilder || pageData.DisplayProposer) && dbSlot.Status > 0 {
 				if dbSlot.BuilderIndex == -1 {
 					slotData.HasBuilder = true
 					slotData.BuilderIndex = math.MaxUint64
@@ -309,7 +327,20 @@ func buildBlocksPageData(ctx context.Context, firstSlot uint64, pageSize uint64,
 					slotData.HasBuilder = true
 					slotData.BuilderIndex = uint64(dbSlot.BuilderIndex)
 					slotData.BuilderName = services.GlobalBeaconService.GetValidatorName(uint64(dbSlot.BuilderIndex) | services.BuilderIndexFlag)
+					slotData.BuilderURL = services.GlobalBeaconService.GetBuilderURL(uint64(dbSlot.BuilderIndex))
 				}
+			}
+
+			// Gloas builder-payment quorum (same-slot attester balance vs per-slot base). Only
+			// meaningful for builder-built blocks; the base is recovered from weight/percent.
+			if pageData.DisplayBuilderPayment && dbSlot.Status > 0 && chainState.IsEip7732Enabled(phase0.Epoch(epoch)) {
+				slotData.HasBuilderPayment = true
+				slotData.BuilderPaymentWeight = dbSlot.BuilderPaymentWeight
+				slotData.BuilderPaymentPercent = float64(dbSlot.BuilderPaymentPercent)
+				if dbSlot.BuilderPaymentPercent > 0 {
+					slotData.BuilderPaymentBase = uint64(float64(dbSlot.BuilderPaymentWeight) / float64(dbSlot.BuilderPaymentPercent) * 100)
+				}
+				slotData.BuilderPaymentMetQuorum = float64(dbSlot.BuilderPaymentPercent) >= statetransition.BuilderPaymentQuorumPercent
 			}
 
 			// Add execution times if available

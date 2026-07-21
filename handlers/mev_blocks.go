@@ -237,7 +237,7 @@ func buildFilteredMevBlocksPageData(ctx context.Context, pageIdx uint64, pageSiz
 			BlockNumber:    mevBlock.BlockNumber,
 			Time:           chainState.SlotToTime(phase0.Slot(mevBlock.SlotNumber)),
 			ValidatorIndex: mevBlock.ProposerIndex,
-			ValidatorName:  services.GlobalBeaconService.GetValidatorName(mevBlock.ProposerIndex),
+			ValidatorName:  services.GlobalBeaconService.GetValidatorNameAt(mevBlock.ProposerIndex, phase0.Slot(mevBlock.SlotNumber)),
 			BuilderPubkey:  mevBlock.BuilderPubkey,
 			Proposed:       mevBlock.Proposed,
 			Relays:         []*models.MevBlocksPageDataRelay{},
@@ -262,6 +262,12 @@ func buildFilteredMevBlocksPageData(ctx context.Context, pageIdx uint64, pageSiz
 		pageData.MevBlocks = append(pageData.MevBlocks, mevBlockData)
 	}
 	pageData.BlockCount = uint64(len(pageData.MevBlocks))
+
+	ensAddrs := make([][]byte, 0, len(pageData.MevBlocks))
+	for _, mevBlock := range pageData.MevBlocks {
+		ensAddrs = append(ensAddrs, mevBlock.FeeRecipient)
+	}
+	pageData.SetEnsNames(resolveEnsNames(ctx, ensAddrs))
 
 	if pageData.BlockCount > 0 {
 		pageData.FirstIndex = pageData.MevBlocks[0].SlotNumber

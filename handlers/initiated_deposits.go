@@ -16,6 +16,7 @@ import (
 	"github.com/ethpandaops/dora/templates"
 	"github.com/ethpandaops/dora/types/models"
 	v1 "github.com/ethpandaops/go-eth2-client/api/v1"
+	"github.com/ethpandaops/go-eth2-client/spec/gloas"
 	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 )
@@ -181,7 +182,7 @@ func buildFilteredInitiatedDepositsPageData(ctx context.Context, pageIdx uint64,
 	}
 
 	for _, depositTx := range dbDepositTxs {
-		isBuilder := len(depositTx.WithdrawalCredentials) > 0 && depositTx.WithdrawalCredentials[0] == 0x03
+		isBuilder := len(depositTx.WithdrawalCredentials) > 0 && depositTx.WithdrawalCredentials[0] == 0xB0
 
 		depositTxData := &models.InitiatedDepositsPageDataDeposit{
 			Index:                 depositTx.Index,
@@ -201,13 +202,32 @@ func buildFilteredInitiatedDepositsPageData(ctx context.Context, pageIdx uint64,
 		if validatorIdx, found := services.GlobalBeaconService.GetValidatorIndexByPubkey(phase0.BLSPubKey(depositTx.PublicKey)); !found {
 			depositTxData.ValidatorStatus = "Deposited"
 			depositTxData.ValidatorExists = false
+		} else if uint64(validatorIdx)&services.BuilderIndexFlag != 0 {
+			builderIndex := uint64(validatorIdx) &^ services.BuilderIndexFlag
+			depositTxData.IsBuilder = true
+			depositTxData.ValidatorExists = true
+			depositTxData.ValidatorIndex = builderIndex
+			depositTxData.ValidatorName = services.GlobalBeaconService.GetValidatorName(uint64(validatorIdx))
+
+			builder := services.GlobalBeaconService.GetBuilderByIndex(gloas.BuilderIndex(builderIndex))
+			if builder == nil {
+				depositTxData.ValidatorStatus = "Deposited"
+			} else if builder.WithdrawableEpoch <= services.GlobalBeaconService.GetChainState().CurrentEpoch() {
+				depositTxData.ValidatorStatus = "Exited"
+			} else {
+				depositTxData.ValidatorStatus = "Active"
+			}
 		} else {
 			depositTxData.ValidatorExists = true
 			depositTxData.ValidatorIndex = uint64(validatorIdx)
-			depositTxData.ValidatorName = services.GlobalBeaconService.GetValidatorName(uint64(validatorIdx))
+			depositTxData.ProjectedIndex = services.GlobalBeaconService.IsProjectedValidatorIndex(validatorIdx)
+			depositTxData.IsBuilder = false
+			depositTxData.ValidatorName = services.GlobalBeaconService.GetValidatorNameAtTime(uint64(validatorIdx), int64(depositTx.BlockTime))
 
 			validator := services.GlobalBeaconService.GetValidatorByIndex(validatorIdx, false)
-			if strings.HasPrefix(validator.Status.String(), "pending") {
+			if validator == nil {
+				depositTxData.ValidatorStatus = "Deposited"
+			} else if strings.HasPrefix(validator.Status.String(), "pending") {
 				depositTxData.ValidatorStatus = "Pending"
 			} else if validator.Status == v1.ValidatorStateActiveOngoing {
 				depositTxData.ValidatorStatus = "Active"
@@ -235,6 +255,12 @@ func buildFilteredInitiatedDepositsPageData(ctx context.Context, pageIdx uint64,
 		pageData.Deposits = append(pageData.Deposits, depositTxData)
 	}
 	pageData.DepositCount = uint64(len(pageData.Deposits))
+
+	ensAddrs := make([][]byte, 0, len(pageData.Deposits))
+	for _, deposit := range pageData.Deposits {
+		ensAddrs = append(ensAddrs, deposit.Address)
+	}
+	pageData.SetEnsNames(resolveEnsNames(ctx, ensAddrs))
 
 	if pageData.DepositCount > 0 {
 		pageData.FirstIndex = pageData.Deposits[0].Index

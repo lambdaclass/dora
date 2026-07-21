@@ -41,6 +41,11 @@
       </a>
     </li>
     <li class="nav-item">
+      <a class="nav-link" id="ens-tab" data-bs-toggle="tab" data-bs-target="#ens" href="#ens" role="tab">
+        <i class="fa fa-tag me-1"></i> ENS Resolver
+      </a>
+    </li>
+    <li class="nav-item">
       <a class="nav-link" id="database-tab" data-bs-toggle="tab" data-bs-target="#database" href="#database" role="tab">
         <i class="fa fa-server me-1"></i> Database
       </a>
@@ -71,6 +76,11 @@
     <!-- Execution Tab -->
     <div class="tab-pane fade" id="execution" role="tabpanel">
       {{ template "debugExecutionTab" . }}
+    </div>
+
+    <!-- ENS Resolver Tab -->
+    <div class="tab-pane fade" id="ens" role="tabpanel">
+      {{ template "debugEnsTab" . }}
     </div>
 
     <!-- Database Tab -->
@@ -156,6 +166,56 @@
         </div>
       </div>
     </div>
+  </div>
+</div>
+{{ end }}
+{{ end }}
+
+<!-- ENS Resolver Tab -->
+{{ define "debugEnsTab" }}
+{{ with .EnsResolver }}
+<div class="card mt-0" style="border-top:none; border-top-left-radius:0; border-top-right-radius:0;">
+  <div class="card-body">
+    {{ if not .Enabled }}
+    <div class="alert alert-secondary mb-0">
+      <i class="fa fa-info-circle me-1"></i> The ENS resolver is disabled. Enable it via the <code>ensResolver</code> config block.
+    </div>
+    {{ else }}
+    <div class="row">
+      <div class="col-md-6 mb-4">
+        <h5 class="card-title mb-3"><i class="fa fa-tasks me-1"></i> Queue &amp; Cache</h5>
+        <table class="table table-sm table-borderless">
+          <tbody>
+            <tr><td class="text-muted" style="width:220px;">Resolve Queue (pending / cap)</td><td>{{ formatNumber .QueueLen }} / {{ formatNumber .QueueCap }}</td></tr>
+            <tr><td class="text-muted">Name Cache (LRU / cap)</td><td>{{ formatNumber .CacheLen }} / {{ formatNumber .CacheCap }}</td></tr>
+            <tr><td class="text-muted">Refresh — found</td><td>{{ .RefreshPositive }}</td></tr>
+            <tr><td class="text-muted">Refresh — not found</td><td>{{ .RefreshNegative }}</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="col-md-6 mb-4">
+        <h5 class="card-title mb-3"><i class="fa fa-network-wired me-1"></i> Registries &amp; Multicall</h5>
+        <table class="table table-sm table-borderless">
+          <tbody>
+            <tr><td class="text-muted" style="width:220px;">Probed</td><td>{{ if .Probed }}<span class="badge bg-success">yes</span>{{ else }}<span class="badge bg-secondary">pending</span>{{ end }}</td></tr>
+            <tr><td class="text-muted">Registries (usable / configured)</td><td>{{ len .Registries }} / {{ .ConfiguredRegistries }}</td></tr>
+            <tr><td class="text-muted">Multicall3</td><td>{{ if .MulticallReady }}<span class="badge bg-success">enabled</span> <code>{{ .MulticallAddress }}</code>{{ else }}<span class="badge bg-secondary">individual calls</span>{{ end }}</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <h6 class="mt-2 mb-2">Working Registries</h6>
+    {{ if .Registries }}
+    <ul class="list-unstyled mb-0">
+      {{ range $i, $r := .Registries }}
+      <li class="mb-1"><span class="badge bg-primary me-1">{{ add $i 1 }}</span><code>{{ $r }}</code></li>
+      {{ end }}
+    </ul>
+    {{ else }}
+    <div class="text-muted">{{ if .Probed }}No usable registries found on the target chain.{{ else }}Not probed yet — the first resolve batch probes the configured registries.{{ end }}</div>
+    {{ end }}
+    {{ end }}
   </div>
 </div>
 {{ end }}
@@ -477,6 +537,21 @@
       </div>
     </div>
 
+    {{ with .TierStats }}
+    <div class="row mb-3">
+      <div class="col-md-12">
+        <h5 class="card-title mb-3">Cache Tier (Pebble &rarr; S3 fallback)</h5>
+        <table class="table table-sm table-borderless" style="max-width: 400px;">
+          <tbody>
+            <tr><td class="text-muted" style="width:200px;">Cache Hits</td><td>{{ formatNumber .CacheHits }}</td></tr>
+            <tr><td class="text-muted">Cache Misses (S3 reads)</td><td>{{ formatNumber .CacheMisses }}</td></tr>
+            <tr><td class="text-muted">Hit Rate</td><td>{{ if gt (addI64 .CacheHits .CacheMisses) 0 }}{{ printf "%.1f" .HitRatePct }}%{{ else }}N/A{{ end }}</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {{ end }}
+
     {{ if .PebbleStats }}
     {{ with .PebbleStats }}
     <div class="row">
@@ -611,11 +686,33 @@
             </div>
           </td>
         </tr>
+        <tr>
+          <td>Duties</td>
+          <td class="text-end">{{ formatNumber .DutiesCount }}</td>
+          <td class="text-end">{{ formatByteSize .DutiesSize }}</td>
+          <td class="text-end">{{ if gt .DutiesCount 0 }}{{ formatByteSize (div (float64 .DutiesSize) (float64 .DutiesCount)) }}{{ else }}N/A{{ end }}</td>
+          <td>
+            <div class="progress" style="height: 16px;">
+              <div class="progress-bar bg-success" role="progressbar" style="width: {{ pct .DutiesSize .TotalSize }}%;"></div>
+            </div>
+          </td>
+        </tr>
       </tbody>
     </table>
     {{ end }}
     {{ end }}
     {{ end }}
+
+    {{ with .TxHashIndex }}{{ if .Enabled }}
+    <h5 class="card-title mb-3 mt-4"><i class="fa fa-fingerprint me-1"></i> TX-Hash Index</h5>
+    <table class="table table-sm table-borderless" style="max-width: 400px;">
+      <tbody>
+        <tr><td class="text-muted" style="width:200px;">Store</td><td>{{ .StoreType }}</td></tr>
+        {{ if not .Native }}<tr><td class="text-muted">Entries (approx)</td><td>{{ formatNumber .Count }}</td></tr>{{ end }}
+        {{ if gt .SizeBytes 0 }}<tr><td class="text-muted">Size{{ if .Native }} (estimate){{ end }}</td><td>{{ formatByteSize .SizeBytes }}</td></tr>{{ end }}
+      </tbody>
+    </table>
+    {{ end }}{{ end }}
 
     {{ end }}
   </div>
@@ -668,6 +765,16 @@
             <tr><td class="text-muted" style="width:200px;">Latest Indexed Slot</td><td>{{ formatNumber .LatestSlot }}</td></tr>
           </tbody>
         </table>
+        {{ with .Pruning }}
+        <h5 class="card-title mb-3 mt-4"><i class="fa fa-broom me-1"></i> Pruning</h5>
+        <table class="table table-sm table-borderless">
+          <tbody>
+            <tr><td class="text-muted" style="width:200px;">Last Cleanup</td><td>{{ .LastCleanup }}</td></tr>
+            <tr><td class="text-muted">Relational Pruned Before</td><td>{{ if .RelationalEnabled }}epoch {{ formatNumber .RelationalPrunedEpoch }}{{ else }}<span class="text-muted">disabled</span>{{ end }}</td></tr>
+            <tr><td class="text-muted">Details Pruned Before</td><td>{{ if .DetailsEnabled }}epoch {{ formatNumber .DetailsPrunedEpoch }}{{ else }}<span class="text-muted">disabled</span>{{ end }}</td></tr>
+          </tbody>
+        </table>
+        {{ end }}
       </div>
     </div>
 
@@ -701,6 +808,32 @@
         </tbody>
       </table>
     </div>
+    {{ end }}
+
+    {{ with .Pruning }}
+    {{ if .Runs }}
+    <h6 class="mb-2">Recent Pruning Runs</h6>
+    <div class="table-responsive">
+      <table class="table table-sm table-hover">
+        <thead>
+          <tr><th>Time</th><th>Duration</th><th>Cleared</th></tr>
+        </thead>
+        <tbody>
+          {{ range .Runs }}
+          <tr>
+            <td>{{ .Time }}</td>
+            <td>{{ .Duration }}</td>
+            <td>
+              {{ if .Objects }}
+              {{ range .Objects }}<span class="badge text-bg-secondary me-1 mb-1">{{ .Label }}: {{ formatNumber .Deleted }}{{ if gt .SizeBytes 0 }} ({{ formatByteSize .SizeBytes }}){{ end }}</span>{{ end }}
+              {{ else }}<span class="text-muted">nothing</span>{{ end }}
+            </td>
+          </tr>
+          {{ end }}
+        </tbody>
+      </table>
+    </div>
+    {{ end }}
     {{ end }}
     {{ end }}
   </div>

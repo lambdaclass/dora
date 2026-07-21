@@ -51,11 +51,13 @@ func NewConsolidationIndexer(indexer *execution.IndexerCtx) *ConsolidationIndexe
 		indexer,
 		indexer.Logger.WithField("contract-indexer", "consolidations"),
 		&contractIndexerOptions[dbtypes.ConsolidationRequestTx]{
-			stateKey:        "indexer.consolidationindexer",
-			batchSize:       batchSize,
-			contractAddress: ci.indexerCtx.GetSystemContractAddress(rpc.ConsolidationRequestContract),
-			deployBlock:     uint64(utils.Config.ExecutionApi.ElectraDeployBlock),
-			dequeueRate:     specs.MaxConsolidationRequestsPerPayload,
+			stateKey:  "indexer.consolidationindexer",
+			batchSize: batchSize,
+			contractAddress: func() common.Address {
+				return ci.indexerCtx.GetSystemContractAddress(rpc.ConsolidationRequestContract)
+			},
+			deployBlock: uint64(utils.Config.ExecutionApi.ElectraDeployBlock),
+			dequeueRate: specs.MaxConsolidationRequestsPerPayload,
 
 			processFinalTx:  ci.processFinalTx,
 			processRecentTx: ci.processRecentTx,
@@ -115,7 +117,7 @@ func (ci *ConsolidationIndexer) processFinalTx(log *types.Log, tx *types.Transac
 		return nil, fmt.Errorf("invalid consolidation log")
 	}
 
-	txTo := *tx.To()
+	txTo := txRecipient(tx, log)
 
 	requestTx.BlockTime = header.Time
 	requestTx.TxSender = txFrom[:]
@@ -133,7 +135,7 @@ func (ci *ConsolidationIndexer) processRecentTx(log *types.Log, tx *types.Transa
 		return nil, fmt.Errorf("invalid consolidation log")
 	}
 
-	txTo := *tx.To()
+	txTo := txRecipient(tx, log)
 
 	requestTx.BlockTime = header.Time
 	requestTx.TxSender = txFrom[:]

@@ -5,6 +5,7 @@
     modalFixes();
     window.setInterval(updateTimers, 1000);
     initHeaderSearch();
+    initAddrHighlight();
   });
   var tooltipDict = {};
   var tooltipIdx = 1;
@@ -36,6 +37,8 @@
     checkRefreshCooldown: checkRefreshCooldown,
     serverNow: serverNow,
     updateServerTime: updateServerTime,
+    ensNameFor: ensNameFor,
+    applyEnsToNode: applyEnsToNode,
   };
 
   function modalFixes() {
@@ -52,7 +55,83 @@
     });
   }
 
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function(c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  // ensNamesMap holds the merged address->name lookup from every `.ens-names` JSON block
+  // in the DOM (the layout carries one; lazy-loaded fragments carry their own).
+  var ensNamesMap = {};
+  function refreshEnsNamesMap() {
+    document.querySelectorAll('script.ens-names').forEach(function(blob) {
+      try {
+        var parsed = JSON.parse(blob.textContent || '{}');
+        if (parsed && typeof parsed === 'object') {
+          for (var key in parsed) ensNamesMap[key.toLowerCase()] = parsed[key];
+        }
+      } catch (e) { /* ignore malformed block */ }
+    });
+  }
+  function ensNameFor(address) {
+    return address ? (ensNamesMap[String(address).toLowerCase()] || null) : null;
+  }
+
+  // setEnsTooltip sets a node's tooltip to "<name><br><address>" using Bootstrap's
+  // data-bs-title (NOT the native `title`, which would show a second browser tooltip that
+  // renders the <br> literally). Any already-initialized tooltip is disposed so it is
+  // recreated with the ENS content instead of keeping the stale address-only text.
+  function setEnsTooltip(node, name, addr) {
+    var existing = bootstrap.Tooltip.getInstance(node);
+    if (existing) existing.dispose();
+    var oldIdx = node.getAttribute('data-tooltip-idx');
+    if (oldIdx && tooltipDict[oldIdx]) delete tooltipDict[oldIdx];
+    $(node).removeData('tooltip-init');
+    node.removeAttribute('data-tooltip-idx');
+    node.removeAttribute('title');
+    node.removeAttribute('data-bs-original-title');
+    node.setAttribute('data-bs-toggle', 'tooltip');
+    node.setAttribute('data-bs-html', 'true');
+    node.setAttribute('data-bs-title', escapeHtml(name) + '<br>' + String(addr).toLowerCase());
+  }
+
+  // applyEnsToNode swaps a single element's text for the ENS name of `address` (if any),
+  // adding the ellipsis class and a full-name+address tooltip. Copy/href stay untouched.
+  // Returns true when a name was applied. Used for client-rendered callouts.
+  function applyEnsToNode(node, address) {
+    if (!node) return false;
+    var name = ensNameFor(address);
+    if (!name) return false;
+    node.textContent = name;
+    node.classList.add('ens-name');
+    setEnsTooltip(node, name, address);
+    return true;
+  }
+
+  // applyEnsNames swaps the displayed text of address elements for their resolved ENS
+  // name. It merges every `.ens-names` block (so it works after lazy content is injected)
+  // and is idempotent (skips already-swapped nodes) and re-runnable — it is called from
+  // initControls, which runs again after lazy content loads. href/clipboard stay raw.
+  function applyEnsNames() {
+    refreshEnsNamesMap();
+    if (Object.keys(ensNamesMap).length === 0) return;
+
+    document.querySelectorAll('.ens-addr[data-address]').forEach(function(node) {
+      if (node.getAttribute('data-ens-applied')) return;
+      var addr = (node.getAttribute('data-address') || '').toLowerCase();
+      var name = ensNamesMap[addr];
+      if (!name) return;
+      node.textContent = name;
+      node.classList.add('ens-name');
+      setEnsTooltip(node, name, addr);
+      node.setAttribute('data-ens-applied', '1');
+    });
+  }
+
   function initControls() {
+    // swap addresses for ENS names before tooltips are initialized
+    applyEnsNames();
     // init tooltips:
     // NOTE: `data-bs-toogle="tooltip"`` tooltips will also get cleaned up if their relevant element is removed from the DOM
     document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(initTooltip);
@@ -64,6 +143,49 @@
     var clipboard = new ClipboardJS('[data-clipboard-text], [data-clipboard-target]');
     clipboard.on("success", onClipboardSuccess);
     clipboard.on("error", onClipboardError);
+
+    fitMethodBadges();
+  }
+
+  // fitMethodBadges shrinks the font of method badges whose label overflows the
+  // capped width, so long method names stay on one line before the CSS ellipsis
+  // kicks in.
+  function fitMethodBadges() {
+    document.querySelectorAll('.method-badge').forEach(function(el) {
+      el.classList.remove('method-badge-sm');
+      if (el.scrollWidth > el.clientWidth + 1) {
+        el.classList.add('method-badge-sm');
+      }
+    });
+  }
+
+  // initAddrHighlight highlights all equal address links within the hovered
+  // scope (an EL data table or the internal-tx tree). Uses event delegation so
+  // it also covers rows/nodes that are loaded lazily after page load.
+  function initAddrHighlight() {
+    var current = null;
+    function clear() {
+      if (!current) return;
+      document.querySelectorAll('a.addr-hl').forEach(function(el) { el.classList.remove('addr-hl'); });
+      current = null;
+    }
+    document.addEventListener('mouseover', function(ev) {
+      var a = ev.target.closest ? ev.target.closest('a[href^="/address/0x"]') : null;
+      if (!a) { return; }
+      var scope = a.closest('.el-data-table, .itx-wrap');
+      if (!scope) { return; }
+      var href = a.getAttribute('href');
+      if (href === current) { return; }
+      clear();
+      current = href;
+      scope.querySelectorAll('a[href="' + href + '"]').forEach(function(el) {
+        el.classList.add('addr-hl');
+      });
+    });
+    document.addEventListener('mouseout', function(ev) {
+      var a = ev.target.closest ? ev.target.closest('a[href^="/address/0x"]') : null;
+      if (a) { clear(); }
+    });
   }
 
   function initTooltip(el) {

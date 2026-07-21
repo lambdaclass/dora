@@ -28,6 +28,8 @@ type BuildersPageData struct {
 	FilteredPageLink string                     `json:"filtered_page_link"`
 
 	UrlParams map[string]string `json:"url_params"`
+
+	EnsNameData
 }
 
 type BuildersPageDataStatusOption struct {
@@ -54,11 +56,15 @@ type BuilderPageData struct {
 	CurrentEpoch     uint64 `json:"current_epoch"`
 	Index            uint64 `json:"index"`
 	Name             string `json:"name"`
+	BuildoorURL      string `json:"buildoor_url"`
 	PublicKey        []byte `json:"pubkey"`
 	Balance          uint64 `json:"balance"`
 	ExecutionAddress []byte `json:"execution_address"`
 	Version          uint8  `json:"version"`
 	State            string `json:"state"` // "Pending", "Active", "Exited", "Superseded"
+	// RouteKey is the canonical URL segment for this builder: the index for the current occupant,
+	// or "0x<pubkey>" for a superseded builder whose index was reused by a different builder.
+	RouteKey string `json:"route_key"`
 
 	// Deposit lifecycle
 	ShowDeposit  bool      `json:"show_deposit"`
@@ -92,6 +98,8 @@ type BuilderPageData struct {
 	WithdrawalCount           uint64                       `json:"withdrawal_count"`
 	AdditionalWithdrawalCount uint64                       `json:"additional_withdrawal_count"`
 	HasMoreBlocks             bool                         `json:"has_more_blocks"`
+
+	EnsNameData
 }
 
 // BuilderPageDataBlock represents a block/payload built by this builder
@@ -129,6 +137,7 @@ type BuilderPageDataDeposit struct {
 	SlotRoot           []byte                           `json:"slot_root"`
 	Time               time.Time                        `json:"time"`
 	Orphaned           bool                             `json:"orphaned"`
+	IsOnboarding       bool                             `json:"is_onboarding"` // onboarded from the pending deposit queue at the Gloas fork transition
 	Amount             uint64                           `json:"amount"`
 	DepositorAddress   []byte                           `json:"depositor_address" ssz-size:"20"`
 	HasTransaction     bool                             `json:"has_transaction"`

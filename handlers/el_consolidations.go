@@ -222,13 +222,13 @@ func buildFilteredElConsolidationsPageData(ctx context.Context, pageIdx uint64, 
 
 		if sourceIndex := consolidation.SourceIndex(); sourceIndex != nil {
 			elConsolidationData.SourceValidatorIndex = *sourceIndex
-			elConsolidationData.SourceValidatorName = services.GlobalBeaconService.GetValidatorName(*sourceIndex)
+			elConsolidationData.SourceValidatorName = consolidation.ResolveSourceName(services.GlobalBeaconService)
 			elConsolidationData.SourceValidatorValid = true
 		}
 
 		if targetIndex := consolidation.TargetIndex(); targetIndex != nil {
 			elConsolidationData.TargetValidatorIndex = *targetIndex
-			elConsolidationData.TargetValidatorName = services.GlobalBeaconService.GetValidatorName(*targetIndex)
+			elConsolidationData.TargetValidatorName = consolidation.ResolveTargetName(services.GlobalBeaconService)
 			elConsolidationData.TargetValidatorValid = true
 		}
 
@@ -275,6 +275,15 @@ func buildFilteredElConsolidationsPageData(ctx context.Context, pageIdx uint64, 
 	}
 
 	pageData.RequestCount = uint64(len(pageData.ElRequests))
+
+	ensAddrs := make([][]byte, 0, len(pageData.ElRequests))
+	for _, elConsolidation := range pageData.ElRequests {
+		ensAddrs = append(ensAddrs, elConsolidation.SourceAddr)
+		if elConsolidation.TransactionDetails != nil {
+			ensAddrs = appendEnsHexAddrs(ensAddrs, elConsolidation.TransactionDetails.TxOrigin, elConsolidation.TransactionDetails.TxTarget)
+		}
+	}
+	pageData.SetEnsNames(resolveEnsNames(ctx, ensAddrs))
 
 	if pageData.RequestCount > 0 {
 		pageData.FirstIndex = pageData.ElRequests[0].SlotNumber

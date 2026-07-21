@@ -314,7 +314,7 @@ func buildFilteredWithdrawalsListPageData(ctx context.Context, pageIdx uint64, p
 		} else {
 			withdrawalData.ValidatorIndex = withdrawal.Validator
 		}
-		withdrawalData.ValidatorName = services.GlobalBeaconService.GetValidatorName(withdrawal.Validator)
+		withdrawalData.ValidatorName = services.GlobalBeaconService.GetValidatorNameAt(withdrawal.Validator, phase0.Slot(slot))
 
 		// Resolve address from account_id
 		if withdrawal.AccountID > 0 {
@@ -344,6 +344,12 @@ func buildFilteredWithdrawalsListPageData(ctx context.Context, pageIdx uint64, p
 		pageData.Withdrawals = append(pageData.Withdrawals, withdrawalData)
 	}
 	pageData.WithdrawalCount = uint64(len(pageData.Withdrawals))
+
+	ensAddrs := make([][]byte, 0, len(pageData.Withdrawals))
+	for _, withdrawal := range pageData.Withdrawals {
+		ensAddrs = append(ensAddrs, withdrawal.Address)
+	}
+	pageData.SetEnsNames(resolveEnsNames(ctx, ensAddrs))
 
 	if pageData.WithdrawalCount > 0 {
 		pageData.FirstIndex = pageData.Withdrawals[0].SlotNumber

@@ -144,13 +144,13 @@ func buildConsolidationsPageData(ctx context.Context, firstEpoch uint64, pageSiz
 
 			if sourceIndex := consolidation.SourceIndex(); sourceIndex != nil {
 				consolidationData.SourceValidatorIndex = *sourceIndex
-				consolidationData.SourceValidatorName = services.GlobalBeaconService.GetValidatorName(*sourceIndex)
+				consolidationData.SourceValidatorName = consolidation.ResolveSourceName(services.GlobalBeaconService)
 				consolidationData.SourceValidatorValid = true
 			}
 
 			if targetIndex := consolidation.TargetIndex(); targetIndex != nil {
 				consolidationData.TargetValidatorIndex = *targetIndex
-				consolidationData.TargetValidatorName = services.GlobalBeaconService.GetValidatorName(*targetIndex)
+				consolidationData.TargetValidatorName = consolidation.ResolveTargetName(services.GlobalBeaconService)
 				consolidationData.TargetValidatorValid = true
 			}
 
@@ -177,6 +177,12 @@ func buildConsolidationsPageData(ctx context.Context, firstEpoch uint64, pageSiz
 		}
 		pageData.RecentConsolidationCount = uint64(len(pageData.RecentConsolidations))
 
+		ensAddrs := make([][]byte, 0, len(pageData.RecentConsolidations))
+		for _, consolidation := range pageData.RecentConsolidations {
+			ensAddrs = append(ensAddrs, consolidation.SourceAddr)
+		}
+		pageData.SetEnsNames(resolveEnsNames(ctx, ensAddrs))
+
 	case "queue":
 		// Load consolidation queue
 		queueConsolidations, _ := services.GlobalBeaconService.GetConsolidationQueueByFilter(ctx, &services.ConsolidationQueueFilter{}, 0, 20)
@@ -190,7 +196,9 @@ func buildConsolidationsPageData(ctx context.Context, firstEpoch uint64, pageSiz
 				queueData.SourceEffectiveBalance = uint64(queueEntry.SrcValidator.Validator.EffectiveBalance)
 
 				validator := services.GlobalBeaconService.GetValidatorByIndex(queueEntry.SrcValidator.Index, false)
-				if strings.HasPrefix(validator.Status.String(), "pending") {
+				if validator == nil {
+					queueData.SourceValidatorStatus = "Unknown"
+				} else if strings.HasPrefix(validator.Status.String(), "pending") {
 					queueData.SourceValidatorStatus = "Pending"
 				} else if validator.Status == v1.ValidatorStateActiveOngoing {
 					queueData.SourceValidatorStatus = "Active"

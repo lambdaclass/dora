@@ -109,6 +109,7 @@ func buildIndexPageData(ctx context.Context) (*models.IndexPageData, time.Durati
 
 	finalizedEpoch, _ := chainState.GetFinalizedCheckpoint()
 	justifiedEpoch, _ := chainState.GetJustifiedCheckpoint()
+	safeSlot, safeRoot, lastFastConfirmation := chainState.GetFastConfirmedBlock()
 
 	syncState := dbtypes.IndexerSyncState{}
 	db.GetExplorerState(ctx, "indexer.syncstate", &syncState)
@@ -132,6 +133,9 @@ func buildIndexPageData(ctx context.Context) (*models.IndexPageData, time.Durati
 		CurrentSlot:           uint64(currentSlot),
 		CurrentScheduledCount: specs.SlotsPerEpoch - uint64(currentSlotIndex),
 		CurrentEpochProgress:  float64(100) * float64(currentSlotIndex) / float64(specs.SlotsPerEpoch),
+		FcrEnabled:            !lastFastConfirmation.IsZero(),
+		SafeSlot:              uint64(safeSlot),
+		SafeRoot:              safeRoot[:],
 	}
 	if utils.Config.Chain.DisplayName != "" {
 		pageData.NetworkName = utils.Config.Chain.DisplayName
@@ -150,35 +154,25 @@ func buildIndexPageData(ctx context.Context) (*models.IndexPageData, time.Durati
 	pageData.ExitingValidatorCount = exitQueueLength
 
 	if specs.ElectraForkEpoch != nil && *specs.ElectraForkEpoch <= uint64(currentEpoch) {
-		// electra deposit queue
-		depositQueue := services.GlobalBeaconService.GetBeaconIndexer().GetLatestDepositQueue(nil)
-		if depositQueue != nil {
-			depositAmount := phase0.Gwei(0)
-			validatorCount := uint64(0)
-
-			newValidators := map[phase0.BLSPubKey]interface{}{}
-			for _, deposit := range depositQueue {
-				depositAmount += deposit.Amount
-				_, found := services.GlobalBeaconService.GetValidatorIndexByPubkey(deposit.Pubkey)
-				if !found {
-					_, isNew := newValidators[deposit.Pubkey]
-					if !isNew {
-						newValidators[deposit.Pubkey] = nil
-						validatorCount++
-					}
-				}
-			}
-
-			pageData.EnteringValidatorCount += validatorCount
-			pageData.EnteringEtherAmount = uint64(depositAmount)
+		// electra deposit queue - use the shared indexed queue so the entering counts match
+		// the deposits page (TotalNew counts projected validators that the raw queue does not).
+		headBlock := services.GlobalBeaconService.GetBeaconIndexer().GetCanonicalHead(nil)
+		queuedDeposits := services.GlobalBeaconService.GetIndexedDepositQueue(ctx, headBlock)
+		if queuedDeposits != nil {
+			pageData.EnteringValidatorCount = queuedDeposits.TotalNew
+			pageData.EnteringEtherAmount = uint64(queuedDeposits.TotalGwei)
 			pageData.EtherChurnPerEpoch = chainState.GetActivationExitChurnLimit(pageData.TotalEligibleEther)
 			pageData.EtherChurnPerDay = pageData.EtherChurnPerEpoch * 225
 
-			depositQueueTime := float64(depositAmount) / float64(pageData.EtherChurnPerDay)
-			if depositQueueTime > 0 {
-				depositQueueDays, depositQueueFractionalDays := math.Modf(depositQueueTime)
-				depositQueueHours := int(depositQueueFractionalDays * 24)
-				pageData.NewDepositProcessAfter = fmt.Sprintf("%d days and %d hours", int(depositQueueDays), depositQueueHours)
+			// QueueEstimation is the epoch the queue is fully processed; render the remaining
+			// time as a coarse "X days and Y hours" string (0 for an empty/all-postponed queue).
+			if queuedDeposits.QueueEstimation > 0 {
+				depositQueueTime := time.Until(chainState.EpochToTime(queuedDeposits.QueueEstimation))
+				if depositQueueTime > 0 {
+					depositQueueDays := int(depositQueueTime.Hours()) / 24
+					depositQueueHours := int(depositQueueTime.Hours()) % 24
+					pageData.NewDepositProcessAfter = fmt.Sprintf("%d days and %d hours", depositQueueDays, depositQueueHours)
+				}
 			}
 		}
 	} else {
@@ -420,6 +414,19 @@ func buildIndexPageRecentEpochsData(ctx context.Context, pageData *models.IndexP
 		if specs.SlotsPerEpoch > 0 {
 			proposalParticipation = float64(epochData.BlockCount) * 100.0 / float64(specs.SlotsPerEpoch)
 		}
+
+		// Pre-ePBS the execution payload is bundled inside the beacon block, so every
+		// canonical block implicitly carries a payload. Post-ePBS (EIP-7732) payloads are
+		// revealed separately and may be missing, so use the dedicated payload count.
+		payloadCount := uint64(epochData.BlockCount)
+		if chainState.IsEip7732Enabled(phase0.Epoch(epochData.Epoch)) {
+			payloadCount = epochData.PayloadCount
+		}
+		payloadParticipation := float64(0)
+		if specs.SlotsPerEpoch > 0 {
+			payloadParticipation = float64(payloadCount) * 100.0 / float64(specs.SlotsPerEpoch)
+		}
+
 		pageData.RecentEpochs = append(pageData.RecentEpochs, &models.IndexPageDataEpochs{
 			Epoch:                 epochData.Epoch,
 			Ts:                    chainState.EpochToTime(phase0.Epoch(epochData.Epoch)),
@@ -431,6 +438,8 @@ func buildIndexPageRecentEpochsData(ctx context.Context, pageData *models.IndexP
 			BlockCount:            uint64(epochData.BlockCount),
 			SlotsPerEpoch:         specs.SlotsPerEpoch,
 			ProposalParticipation: proposalParticipation,
+			PayloadCount:          payloadCount,
+			PayloadParticipation:  payloadParticipation,
 		})
 	}
 	pageData.RecentEpochCount = uint64(len(pageData.RecentEpochs))
@@ -468,7 +477,7 @@ func buildIndexPageRecentBlocksData(ctx context.Context, pageData *models.IndexP
 			Slot:          blockData.Slot,
 			Ts:            chainState.SlotToTime(phase0.Slot(blockData.Slot)),
 			Proposer:      blockData.Proposer,
-			ProposerName:  services.GlobalBeaconService.GetValidatorName(blockData.Proposer),
+			ProposerName:  services.GlobalBeaconService.GetValidatorNameAt(blockData.Proposer, phase0.Slot(blockData.Slot)),
 			Status:        uint64(blockData.Status),
 			PayloadStatus: uint8(payloadStatus),
 			BlockRoot:     blockData.Root,
@@ -494,6 +503,8 @@ func buildIndexPageRecentSlotsData(ctx context.Context, pageData *models.IndexPa
 	}
 
 	chainState := services.GlobalBeaconService.GetChainState()
+	safeSlot, _, lastFastConfirmation := chainState.GetFastConfirmedBlock()
+	fcrEnabled := !lastFastConfirmation.IsZero()
 
 	// load slots
 	pageData.RecentSlots = make([]*models.IndexPageDataSlots, 0)
@@ -522,8 +533,9 @@ func buildIndexPageRecentSlotsData(ctx context.Context, pageData *models.IndexPa
 				Ts:            chainState.SlotToTime(phase0.Slot(slot)),
 				Status:        uint64(dbSlot.Status),
 				PayloadStatus: uint8(payloadStatus),
+				Safe:          fcrEnabled && dbSlot.Status == dbtypes.Canonical && slot <= uint64(safeSlot),
 				Proposer:      dbSlot.Proposer,
-				ProposerName:  services.GlobalBeaconService.GetValidatorName(dbSlot.Proposer),
+				ProposerName:  services.GlobalBeaconService.GetValidatorNameAt(dbSlot.Proposer, phase0.Slot(slot)),
 				BlockRoot:     dbSlot.Root,
 				ParentRoot:    dbSlot.ParentRoot,
 				ForkGraph:     make([]*models.IndexPageDataForkGraph, 0),

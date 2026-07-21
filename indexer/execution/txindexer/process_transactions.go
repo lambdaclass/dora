@@ -3,11 +3,16 @@ package txindexer
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"sort"
+	"strings"
 	"time"
 
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -124,15 +129,114 @@ type txProcessingResult struct {
 	fromAccount    *pendingAccount
 	toAccount      *pendingAccount
 
+	// Revert reason: reverted is set from the receipt status. revertReservedID is
+	// a reserved id for a well-known EVM error (else 0); revertReason is the
+	// decoded reason text for dynamic dedup (empty when not traced or none).
+	reverted         bool
+	revertReservedID uint32
+	revertReason     string
+
 	// Call trace data (populated in Mode Full + tracesEnabled)
-	internalCalls []*pendingInternalCall
-	callTraceData []bdbtypes.FlatCallFrame // Flattened call trace for blockdb serialization
+	internalAggregates map[*pendingAccount]*pendingInternalAggregate
+	callTraceData      []bdbtypes.FlatCallFrame // Flattened call trace for blockdb serialization
 
 	// State changes data (populated in Mode Full + tracesEnabled)
 	stateChangesData []bdbtypes.StateChangeAccount
 
 	// Receipt metadata (populated in Mode Full for receipt reconstruction)
 	receiptMeta *bdbtypes.ReceiptMetaData
+}
+
+// solidityPanicReasons maps Panic(uint256) codes to readable descriptions.
+var solidityPanicReasons = map[uint64]string{
+	0x00: "generic panic",
+	0x01: "assertion failed",
+	0x11: "arithmetic overflow or underflow",
+	0x12: "division or modulo by zero",
+	0x21: "invalid enum conversion",
+	0x22: "corrupted storage byte array",
+	0x31: "pop on empty array",
+	0x32: "array index out of bounds",
+	0x41: "memory allocation overflow",
+	0x51: "call to invalid internal function",
+}
+
+// decodeRevertReason extracts a revert reason from the root call frame. It
+// returns either a reserved revert_id for a well-known EVM error (the full text
+// stays visible in the call-trace tab) or a reason string for dynamic dedup;
+// both are empty/zero when there is no decodable reason. It decodes
+// Error(string) and Panic(uint256) payloads and reduces custom errors to their
+// 4-byte selector to keep the deduped reason set bounded.
+func decodeRevertReason(frame bdbtypes.FlatCallFrame) (reason string, reservedID uint32) {
+	out := frame.Output
+	if len(out) >= 4 {
+		switch binary.BigEndian.Uint32(out[:4]) {
+		case 0x08c379a0: // Error(string)
+			if r, err := abi.UnpackRevert(out); err == nil && r != "" {
+				return truncateRevertReason(r), 0
+			}
+		case 0x4e487b71: // Panic(uint256)
+			if len(out) >= 36 {
+				code := new(big.Int).SetBytes(out[4:36])
+				if code.IsUint64() {
+					if desc, ok := solidityPanicReasons[code.Uint64()]; ok {
+						return "Panic: " + desc, 0
+					}
+				}
+				return "Panic(0x" + code.Text(16) + ")", 0
+			}
+		default: // custom error: selector only, to bound cardinality
+			return "Custom(0x" + hex.EncodeToString(out[:4]) + ")", 0
+		}
+	}
+	if frame.Error != "" {
+		if id := reservedRevertID(frame.Error); id != 0 {
+			return "", id
+		}
+		return truncateRevertReason(frame.Error), 0
+	}
+	return "", 0
+}
+
+// reservedRevertID maps a well-known EVM execution error to a reserved revert_id
+// by substring match, or 0 if none match.
+func reservedRevertID(errText string) uint32 {
+	e := strings.ToLower(errText)
+	switch {
+	case strings.Contains(e, "out of gas"):
+		return dbtypes.RevertIDOutOfGas
+	case strings.Contains(e, "stack underflow"):
+		return dbtypes.RevertIDStackUnderflow
+	case strings.Contains(e, "invalid opcode"):
+		return dbtypes.RevertIDInvalidOpcode
+	}
+	return 0
+}
+
+func truncateRevertReason(s string) string {
+	const maxLen = 1024
+	if len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	// Revert/error strings are attacker-controlled; sanitize to valid UTF-8 so
+	// the stored reason is safe to persist and render.
+	return strings.ToValidUTF8(s, "?")
+}
+
+// resolveRevertID maps a decoded revert reason to a revert_id: the "unknown"
+// sentinel when no reason was decoded, else a deduped el_revert_reason id. On
+// error it falls back to the sentinel rather than failing the block.
+func (ctx *txProcessingContext) resolveRevertID(commitCtx context.Context, dbTx *sqlx.Tx, reason string, txUid uint64) uint32 {
+	if reason == "" {
+		return dbtypes.RevertIDUnknown
+	}
+	hash := sha256.Sum256([]byte(reason))
+	id, err := db.ResolveElRevertReason(commitCtx, dbTx, reason, hash[:16], txUid)
+	if err != nil {
+		ctx.indexer.logger.WithError(err).Warn("failed to resolve revert reason")
+		return dbtypes.RevertIDUnknown
+	}
+	return id
 }
 
 // pendingTxEvent represents an event collected in-memory for event index
@@ -149,14 +253,17 @@ type pendingTxEvent struct {
 	data       []byte   // Event data
 }
 
-// pendingInternalCall represents an internal call extracted from a call trace.
-type pendingInternalCall struct {
-	txCallIdx   uint32
-	callType    uint8
-	fromAccount *pendingAccount
-	toAccount   *pendingAccount
-	value       float64
-	valueRaw    []byte
+// pendingInternalAggregate accumulates per-account internal-call stats for a
+// single transaction. One instance per touched account; updated as the call
+// tree is walked. Persisted as a single row in el_transactions_internal.
+type pendingInternalAggregate struct {
+	account      *pendingAccount
+	inCount      uint32  // calls where account = callee (clamped to uint16 max on flush)
+	outCount     uint32  // calls where account = caller (clamped to uint16 max on flush)
+	callTypeMask uint16  // bits 1<<n set when account was the callee of a CALL of type n
+	valueIn      float64 // sum of value when account was callee
+	valueOut     float64 // sum of value when account was caller
+	gasUsed      uint64  // sum of gas_used across calls involving the account
 }
 
 // pendingTokenTransfer represents a token transfer with references to its token and accounts.
@@ -269,6 +376,11 @@ func (ctx *txProcessingContext) processTransaction(
 		methodID = tx.Data()[:4]
 	}
 
+	txType := tx.Type()
+	if isContractCreation {
+		txType |= dbtypes.ElTxFlagCreate
+	}
+
 	result.transaction = &dbtypes.ElTransaction{
 		TxUid:       ctx.block.BlockUID<<16 | uint64(receipt.TransactionIndex),
 		BlockUid:    ctx.block.BlockUID,
@@ -276,7 +388,6 @@ func (ctx *txProcessingContext) processTransaction(
 		FromID:      fromAccount.id,
 		ToID:        toAccount.id,
 		Nonce:       txNonce,
-		Reverted:    receipt.Status == 0,
 		Amount:      weiToFloat(txValue, 18), // ETH uses 18 decimals
 		AmountRaw:   txValue.Bytes(),
 		MethodID:    methodID,
@@ -286,9 +397,10 @@ func (ctx *txProcessingContext) processTransaction(
 		TipPrice:    tipPrice,
 		BlobCount:   blobCount,
 		BlockNumber: receipt.BlockNumber.Uint64(),
-		TxType:      tx.Type(),
+		TxType:      txType,
 		EffGasPrice: effGasPrice,
 	}
+	result.reverted = receipt.Status == 0
 
 	// Store pending accounts for resolving IDs at commit time
 	result.fromAccount = fromAccount
@@ -348,7 +460,14 @@ func (ctx *txProcessingContext) processTransaction(
 
 	// 6. Process call trace if available (Mode Full + tracesEnabled)
 	if callTrace != nil {
-		result.callTraceData, result.internalCalls = ctx.processCallTrace(callTrace, fromAccount)
+		result.callTraceData, result.internalAggregates = ctx.processCallTrace(callTrace, fromAccount)
+	}
+
+	// Decode the revert reason from the root call frame (index 0 = depth 0).
+	// Only available when traces were collected; otherwise the reason stays empty
+	// and the tx maps to the "unknown" sentinel at commit time.
+	if result.reverted && len(result.callTraceData) > 0 {
+		result.revertReason, result.revertReservedID = decodeRevertReason(result.callTraceData[0])
 	}
 
 	// 7. Process state diffs (storage changes) if available (Mode Full + tracesEnabled)
@@ -1107,29 +1226,31 @@ func (ctx *txProcessingContext) commitTransaction(commitCtx context.Context, dbT
 		result.transaction.FromID = result.fromAccount.id
 		result.transaction.ToID = result.toAccount.id
 
+		// Resolve the revert reason to a revert_id. Well-known EVM errors use a
+		// reserved id directly; other reverts dedup into el_revert_reason; reverts
+		// with no decoded reason map to the "unknown" sentinel.
+		if result.reverted {
+			if result.revertReservedID != 0 {
+				result.transaction.RevertID = result.revertReservedID
+			} else {
+				result.transaction.RevertID = ctx.resolveRevertID(commitCtx, dbTx, result.revertReason, result.transaction.TxUid)
+			}
+		}
+
+		// event_count is the badge count for the events tab; full event data
+		// lives in blockdb (no separate searchable index table).
+		eventCount := len(result.events)
+		if eventCount > 32767 { // clamp to SMALLINT range
+			eventCount = 32767
+		}
+		result.transaction.EventCount = uint16(eventCount)
+
 		if err := db.InsertElTransactions(commitCtx, dbTx, []*dbtypes.ElTransaction{result.transaction}); err != nil {
 			return err
 		}
 	}
 
-	// 4. Insert event index entries (Mode 3 only - lightweight index for search)
-	if ctx.indexer.mode == ModeFull && len(result.events) > 0 {
-		eventIndices := make([]*dbtypes.ElEventIndex, 0, len(result.events))
-		for _, pe := range result.events {
-			eventIndices = append(eventIndices, &dbtypes.ElEventIndex{
-				TxUid:      result.transaction.TxUid,
-				EventIndex: pe.eventIndex,
-				SourceID:   pe.sourceAccount.id,
-				Topic1:     pe.topic1,
-			})
-		}
-
-		if err := db.InsertElEventIndices(commitCtx, dbTx, eventIndices); err != nil {
-			return err
-		}
-	}
-
-	// 5. Insert token transfers with resolved token and account IDs
+	// 4. Insert token transfers with resolved token and account IDs
 	if len(result.tokenTransfers) > 0 {
 		transfers := make([]*dbtypes.ElTokenTransfer, 0, len(result.tokenTransfers))
 		for _, pt := range result.tokenTransfers {
@@ -1155,18 +1276,28 @@ func (ctx *txProcessingContext) commitTransaction(commitCtx context.Context, dbT
 		}
 	}
 
-	// 6. Insert internal call index entries (Mode Full + tracesEnabled)
-	if ctx.indexer.mode == ModeFull && utils.Config.ExecutionIndexer.TracesEnabled && len(result.internalCalls) > 0 {
-		internalEntries := make([]*dbtypes.ElTransactionInternal, 0, len(result.internalCalls))
-		for _, ic := range result.internalCalls {
+	// 6. Insert per-account internal-tx aggregates (Mode Full + tracesEnabled).
+	// One row per touched account regardless of how many sub-calls involved it.
+	if ctx.indexer.mode == ModeFull && utils.Config.ExecutionIndexer.TracesEnabled && len(result.internalAggregates) > 0 {
+		internalEntries := make([]*dbtypes.ElTransactionInternal, 0, len(result.internalAggregates))
+		for _, agg := range result.internalAggregates {
+			inCount := agg.inCount
+			if inCount > 32767 {
+				inCount = 32767 // clamp to SMALLINT max (postgres int2 is signed)
+			}
+			outCount := agg.outCount
+			if outCount > 32767 {
+				outCount = 32767
+			}
 			internalEntries = append(internalEntries, &dbtypes.ElTransactionInternal{
-				TxUid:     result.transaction.TxUid,
-				TxCallIdx: ic.txCallIdx,
-				CallType:  ic.callType,
-				FromID:    ic.fromAccount.id,
-				ToID:      ic.toAccount.id,
-				Value:     ic.value,
-				ValueRaw:  ic.valueRaw,
+				TxUid:        result.transaction.TxUid,
+				AccountID:    agg.account.id,
+				InCount:      uint16(inCount),
+				OutCount:     uint16(outCount),
+				CallTypeMask: agg.callTypeMask,
+				ValueIn:      agg.valueIn,
+				ValueOut:     agg.valueOut,
+				GasUsed:      agg.gasUsed,
 			})
 		}
 
@@ -1180,18 +1311,28 @@ func (ctx *txProcessingContext) commitTransaction(commitCtx context.Context, dbT
 
 // processCallTrace processes a call trace result for a single transaction.
 // It flattens the nested call tree depth-first for blockdb serialization
-// and extracts internal calls (sub-calls, skipping index 0) for the DB index.
+// and builds per-account aggregates over sub-calls (skipping index 0) for
+// the DB index.
 func (ctx *txProcessingContext) processCallTrace(
 	traceResult *exerpc.CallTraceCall,
 	funderAccount *pendingAccount,
-) ([]bdbtypes.FlatCallFrame, []*pendingInternalCall) {
+) ([]bdbtypes.FlatCallFrame, map[*pendingAccount]*pendingInternalAggregate) {
 	if traceResult == nil {
 		return nil, nil
 	}
 
 	frames := make([]bdbtypes.FlatCallFrame, 0, 16)
-	internalCalls := make([]*pendingInternalCall, 0, 16)
+	aggregates := make(map[*pendingAccount]*pendingInternalAggregate, 8)
 	callIdx := uint32(0)
+
+	getAgg := func(acc *pendingAccount) *pendingInternalAggregate {
+		agg, ok := aggregates[acc]
+		if !ok {
+			agg = &pendingInternalAggregate{account: acc}
+			aggregates[acc] = agg
+		}
+		return agg
+	}
 
 	var walkTrace func(call *exerpc.CallTraceCall, depth uint16)
 	walkTrace = func(call *exerpc.CallTraceCall, depth uint16) {
@@ -1208,12 +1349,27 @@ func (ctx *txProcessingContext) processCallTrace(
 			}
 		}
 
+		// callTracer reports gasUsed cumulatively over the subtree, so summing
+		// it across frames double-counts nested execution. Compute the
+		// frame-local gas (this frame's execution only) by subtracting direct
+		// children's cumulative gasUsed. Saturating subtract guards against
+		// rounding/clamping quirks from non-Geth tracers.
+		selfGas := uint64(call.GasUsed)
+		for i := range call.Calls {
+			childGas := uint64(call.Calls[i].GasUsed)
+			if childGas >= selfGas {
+				selfGas = 0
+				break
+			}
+			selfGas -= childGas
+		}
+
 		// Build flat call frame for blockdb
 		frame := bdbtypes.FlatCallFrame{
 			Depth:   depth,
 			Type:    exerpc.CallTypeFromString(call.Type),
 			Gas:     uint64(call.Gas),
-			GasUsed: uint64(call.GasUsed),
+			GasUsed: selfGas,
 			Status:  status,
 			Input:   call.Input,
 			Output:  call.Output,
@@ -1226,25 +1382,43 @@ func (ctx *txProcessingContext) processCallTrace(
 
 		frames = append(frames, frame)
 
-		// Extract internal call for DB index (skip index 0 = top-level call,
-		// which duplicates el_transactions)
+		// Aggregate per touched account (skip index 0 = top-level call,
+		// which duplicates el_transactions).
 		if currentIdx > 0 {
 			fromAccount := ctx.ensureAccount(call.From, funderAccount, false)
 			toAccount := ctx.ensureAccount(call.To, fromAccount, false)
+			callType := exerpc.CallTypeFromString(call.Type)
+			gasUsed := selfGas
 
-			ic := &pendingInternalCall{
-				txCallIdx:   currentIdx,
-				callType:    exerpc.CallTypeFromString(call.Type),
-				fromAccount: fromAccount,
-				toAccount:   toAccount,
+			var value float64
+			// DELEGATECALL executes the callee's code in the caller's context and
+			// never transfers value; the callTracer reports the inherited parent
+			// msg.value on the frame, so it must not be counted as transferred value.
+			if callType != bdbtypes.CallTypeDelegateCall && frame.Value.Sign() > 0 {
+				value = weiToFloat(frame.Value.ToBig(), 18)
 			}
 
-			if frame.Value.Sign() > 0 {
-				ic.value = weiToFloat(frame.Value.ToBig(), 18)
-				ic.valueRaw = frame.Value.Bytes()
-			}
+			if fromAccount == toAccount {
+				// Self-call: account is both caller and callee, count both ways.
+				agg := getAgg(fromAccount)
+				agg.inCount++
+				agg.outCount++
+				agg.callTypeMask |= 1 << callType
+				agg.valueIn += value
+				agg.valueOut += value
+				agg.gasUsed += gasUsed
+			} else {
+				fromAgg := getAgg(fromAccount)
+				fromAgg.outCount++
+				fromAgg.valueOut += value
+				fromAgg.gasUsed += gasUsed
 
-			internalCalls = append(internalCalls, ic)
+				toAgg := getAgg(toAccount)
+				toAgg.inCount++
+				toAgg.callTypeMask |= 1 << callType
+				toAgg.valueIn += value
+				toAgg.gasUsed += gasUsed
+			}
 		}
 
 		// Recurse into child calls
@@ -1254,7 +1428,7 @@ func (ctx *txProcessingContext) processCallTrace(
 	}
 
 	walkTrace(traceResult, 0)
-	return frames, internalCalls
+	return frames, aggregates
 }
 
 // buildExecDataObject builds the per-block execution data object from collected

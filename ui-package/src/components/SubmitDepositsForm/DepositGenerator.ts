@@ -30,7 +30,11 @@ const SigningData = new ContainerType({
   domain: new ByteVectorType(32),
 });
 
-export type CredentialType = '00' | '01' | '02' | '03';
+export type CredentialType = '00' | '01' | '02' | 'b0';
+
+// DepositDomainType selects the signing domain: regular validator deposits use
+// DOMAIN_DEPOSIT (0x03000000); builder deposits use DOMAIN_BUILDER_DEPOSIT (0x0E000000).
+export type DepositDomainType = 'deposit' | 'builder';
 
 export interface WithdrawalCredentialConfig {
   type: CredentialType;
@@ -66,10 +70,10 @@ export function validateMnemonicWords(mnemonic: string): boolean {
 
 /**
  * Build withdrawal credentials from type and ETH address
- * @param credType - '01' for execution, '02' for compounding, '03' for builder
+ * @param credType - '01' for execution, '02' for compounding, 'b0' for builder
  * @param address - 20-byte ETH address (0x prefixed)
  */
-export function buildWithdrawalCredentialsFromAddress(credType: '01' | '02' | '03', address: string): string {
+export function buildWithdrawalCredentialsFromAddress(credType: '01' | '02' | 'b0', address: string): string {
   const cleanAddress = address.startsWith('0x') ? address.slice(2) : address;
   if (cleanAddress.length !== 40) {
     throw new Error("Invalid address length");
@@ -113,9 +117,9 @@ export async function buildWithdrawalCredentials(
     return buildBLSWithdrawalCredentials(withdrawalPubkey);
   } else {
     if (!config.address) {
-      throw new Error("Address required for 0x01/0x02/0x03 credentials");
+      throw new Error("Address required for 0x01/0x02/0xB0 credentials");
     }
-    return buildWithdrawalCredentialsFromAddress(config.type as '01' | '02' | '03', config.address);
+    return buildWithdrawalCredentialsFromAddress(config.type as '01' | '02' | 'b0', config.address);
   }
 }
 
@@ -133,7 +137,8 @@ export function validateWithdrawalCredentials(credentials: string): boolean {
  */
 export async function generateDeposits(
   config: GeneratorConfig,
-  genesisForkVersion: string
+  genesisForkVersion: string,
+  domainType: DepositDomainType = 'deposit'
 ): Promise<IDeposit[]> {
   // Note: BLS library must be initialized before calling this function
   // The caller (DepositGeneratorModal) handles BLS initialization
@@ -155,7 +160,7 @@ export async function generateDeposits(
   const masterKey = deriveKeyFromMnemonic(normalizedMnemonic);
 
   // Compute signing domain
-  const signingDomain = computeSigningDomain(genesisForkVersion);
+  const signingDomain = computeSigningDomain(genesisForkVersion, domainType);
 
   const deposits: IDeposit[] = [];
 
@@ -274,7 +279,7 @@ function generateSingleDeposit(
   };
 }
 
-function computeSigningDomain(genesisForkVersion: string): Uint8Array {
+function computeSigningDomain(genesisForkVersion: string, domainType: DepositDomainType = 'deposit'): Uint8Array {
   const forkVersionBytes = hexToBytes(genesisForkVersion);
 
   const forkData = {
@@ -283,9 +288,10 @@ function computeSigningDomain(genesisForkVersion: string): Uint8Array {
   };
   const forkDataRoot = ForkData.hashTreeRoot(forkData);
 
-  // DOMAIN_DEPOSIT = 0x03000000
+  // DOMAIN_DEPOSIT = 0x03000000, DOMAIN_BUILDER_DEPOSIT = 0x0E000000 (Gloas/EIP-8282)
+  const domainPrefix = domainType === 'builder' ? 0x0e : 0x03;
   const signingDomain = new Uint8Array(32);
-  signingDomain.set([0x03, 0x00, 0x00, 0x00]);
+  signingDomain.set([domainPrefix, 0x00, 0x00, 0x00]);
   signingDomain.set(forkDataRoot.slice(0, 28), 4);
 
   return signingDomain;
