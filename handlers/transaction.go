@@ -1819,6 +1819,10 @@ func frameModeName(mode uint8) string {
 		return "SENDER"
 	case 3:
 		return "POST_TX"
+	// EIP-8312 UTXO frame. Mode 5, not the draft's 3: EIP-7906 already holds 3
+	// upstream, and 4 is reserved for EIP-8288.
+	case 5:
+		return "UTXO"
 	default:
 		return fmt.Sprintf("RESERVED(%d)", mode)
 	}
