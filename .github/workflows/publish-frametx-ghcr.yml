@@ -1,13 +1,17 @@
 name: Publish frame-tx Dora to GHCR
 
 # Publishes the EIP-8141 frame-tx-aware Dora fork to
-# ghcr.io/<owner>/dora:frame-tx-view so it can be used in a kurtosis devnet via:
+# ghcr.io/<owner>/dora:<branch> so it can be used in a kurtosis devnet via:
 #   dora_params:
 #     image: ghcr.io/lambdaclass/dora:frame-tx-view
+#
+# The tag follows the branch, so a branch adding decoding for a new fork
+# publishes alongside the others instead of overwriting them.
 on:
   push:
     branches:
       - frame-tx-view
+      - heze-decode
   workflow_dispatch:
 
 jobs:
@@ -36,6 +40,6 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/dora:frame-tx-view
+          tags: ghcr.io/${{ github.repository_owner }}/dora:${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
