@@ -106,8 +106,8 @@ github.com/donovanhide/eventsource v0.0.0-20210830082556-c59027999da0/go.mod h1:
 github.com/dustin/go-humanize v1.0.0/go.mod h1:HtrtbFcZ19U5GC7JDqmcUSB87Iq5E25KnS6fMYU6eOk=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
 github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
-github.com/edg-l/go-eth2-client v0.1.7-0.20260806155608-3dc55a8411df h1:r5j+eN7wt1aB/lVK2rkXKFCCC2TXtXkajcQiT7kw76o=
-github.com/edg-l/go-eth2-client v0.1.7-0.20260806155608-3dc55a8411df/go.mod h1:qcaftWjJJcrZ/6MgmHBRdfMmUK6IygbBpT8w3TIuVPs=
+github.com/edg-l/go-eth2-client v0.1.7-0.20260806164820-31b4e2293a32 h1:+oNpEJ0PxRWOrb76GtY1kfo23JNPQ/H/w/EBWdUBy1c=
+github.com/edg-l/go-eth2-client v0.1.7-0.20260806164820-31b4e2293a32/go.mod h1:qcaftWjJJcrZ/6MgmHBRdfMmUK6IygbBpT8w3TIuVPs=
 github.com/emicklei/dot v1.9.1 h1:SBySmOPaQ6+fpmnqEaG1bCHj5hW65A0jJpcPpz+TG3w=
 github.com/emicklei/dot v1.9.1/go.mod h1:DeV7GvQtIw4h2u73RKBkkFdvVAz0D9fzeJrgPW6gy/s=
 github.com/ethereum/c-kzg-4844/v2 v2.1.6 h1:xQymkKCT5E2Jiaoqf3v4wsNgjZLY0lRSkZn27fRjSls=
