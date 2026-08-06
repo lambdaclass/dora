@@ -252,4 +252,4 @@ require (
 
 replace github.com/ethereum/go-ethereum => github.com/lambdaclass/go-ethereum v0.0.0-20260721161646-0c4350e280f1
 
-replace github.com/ethpandaops/go-eth2-client => github.com/edg-l/go-eth2-client v0.1.7-0.20260806164820-31b4e2293a32
+replace github.com/ethpandaops/go-eth2-client => github.com/edg-l/go-eth2-client v0.1.7-0.20260806170552-939ea80cb37c

@@ -270,11 +270,9 @@ func processProposerSlashing(s *stateAccessor, slashing *phase0.ProposerSlashing
 	}
 
 	// New in Gloas: clear the BuilderPendingPayment tied to this proposal if it is
-	// still in the 2-epoch window and bound to the slashed proposer (per #5365 the
-	// payment is only griefed when the slashed validator is its proposer).
-	// https://github.com/ethereum/consensus-specs/pull/5365
+	// still in the 2-epoch window.
 	if s.Version >= spec.DataVersionGloas {
-		clearSlashedBuilderPendingPayment(s, header.Slot, proposerIndex)
+		clearSlashedBuilderPendingPayment(s, header.Slot)
 	}
 
 	slashValidator(s, proposerIndex)
@@ -282,8 +280,14 @@ func processProposerSlashing(s *stateAccessor, slashing *phase0.ProposerSlashing
 
 // clearSlashedBuilderPendingPayment removes the builder pending payment recorded
 // for the slashed proposer's slot, if that slot is still within the 2-epoch
-// BuilderPendingPayments window and the payment is bound to the slashed proposer.
-func clearSlashedBuilderPendingPayment(s *stateAccessor, slot phase0.Slot, proposerIndex phase0.ValidatorIndex) {
+// BuilderPendingPayments window.
+//
+// The payment is cleared unconditionally. consensus-specs #5365 narrowed this to
+// payments bound to the slashed proposer, identified by a proposer_index field
+// it added to BuilderPendingPayment, but the client producing this chain
+// predates that change and its states carry no such field.
+// https://github.com/ethereum/consensus-specs/pull/5365
+func clearSlashedBuilderPendingPayment(s *stateAccessor, slot phase0.Slot) {
 	slotsPerEpoch := s.specs.SlotsPerEpoch
 	proposalEpoch := phase0.Epoch(uint64(slot) / slotsPerEpoch)
 
@@ -300,9 +304,7 @@ func clearSlashedBuilderPendingPayment(s *stateAccessor, slot phase0.Slot, propo
 	if paymentIdx >= uint64(len(s.BuilderPendingPayments)) {
 		return
 	}
-	if payment := s.BuilderPendingPayments[paymentIdx]; payment != nil && payment.ProposerIndex == proposerIndex {
-		s.BuilderPendingPayments[paymentIdx] = &gloas.BuilderPendingPayment{}
-	}
+	s.BuilderPendingPayments[paymentIdx] = &gloas.BuilderPendingPayment{}
 }
 
 // processAttesterSlashing processes an attester slashing.
@@ -742,7 +744,6 @@ func processExecutionPayloadBid(s *stateAccessor, block *all.SignedBeaconBlock) 
 					Amount:       bid.Value,
 					BuilderIndex: bid.BuilderIndex,
 				},
-				ProposerIndex: block.Message.ProposerIndex,
 			}
 		}
 	}
