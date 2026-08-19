@@ -250,4 +250,4 @@ require (
 	gopkg.in/yaml.v2 v2.4.0
 )
 
-replace github.com/ethereum/go-ethereum => github.com/lambdaclass/go-ethereum v0.0.0-20260721161646-0c4350e280f1
+replace github.com/ethereum/go-ethereum => github.com/lambdaclass/go-ethereum v0.0.0-20260819211801-c774cb7217d0

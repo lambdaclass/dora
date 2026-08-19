@@ -160,10 +160,14 @@ func (t *TxIndexer) extractTransactionsFromBeaconBlock(block *beacon.Block) ([]*
 	}
 
 	transactions := make([]*types.Transaction, 0, len(payload.Transactions))
-	for _, txBytes := range payload.Transactions {
+	for idx, txBytes := range payload.Transactions {
 		tx := &types.Transaction{}
 		if err := tx.UnmarshalBinary(txBytes); err != nil {
-			t.logger.WithError(err).Debug("failed to unmarshal transaction from beacon block")
+			// Warn, not Debug: a transaction the chain accepted that this decoder
+			// cannot read is skipped here, which makes it unreachable by hash for
+			// the whole explorer. That is a decoder defect every time, and at Debug
+			// level it looks like the transaction was never sent.
+			t.logger.WithError(err).Warnf("skipping transaction %d of slot %v: cannot decode, so it will not be indexed", idx, block.Slot)
 			continue
 		}
 		transactions = append(transactions, tx)

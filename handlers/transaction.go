@@ -806,6 +806,10 @@ func buildTransactionPageDataFromBlockdb(ctx context.Context, pageData *models.T
 
 		var ethTx ethtypes.Transaction
 		if err := ethTx.UnmarshalBinary(rlpData); err != nil {
+			// Log rather than skip in silence: the requested transaction may be the
+			// one that failed to decode, and the page would then claim it does not
+			// exist while the chain has it in a block.
+			logrus.WithError(err).Warnf("cannot decode transaction %d of a candidate block while looking up 0x%x", txIndex, txHash)
 			continue
 		}
 		if !bytes.Equal(ethTx.Hash().Bytes(), txHash) {
@@ -1499,7 +1503,7 @@ func loadFullTransactionData(ctx context.Context, pageData *models.TransactionPa
 	// Parse the transaction to get input data and JSON representation
 	var ethTx ethtypes.Transaction
 	if err := ethTx.UnmarshalBinary(rlpData); err != nil {
-		logrus.WithError(err).Debug("failed to parse transaction RLP")
+		logrus.WithError(err).Warn("failed to parse transaction RLP; the page will be missing its envelope details")
 		return
 	}
 
