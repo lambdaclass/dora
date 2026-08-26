@@ -234,7 +234,7 @@ func (t *TxIndexer) fetchBlockTransactions(
 		if err := json.Unmarshal(rawTx, &txHeader); err == nil {
 			switch txHeader.Type {
 			case types.LegacyTxType, types.AccessListTxType, types.DynamicFeeTxType,
-				types.BlobTxType, types.SetCodeTxType:
+				types.BlobTxType, types.SetCodeTxType, types.FrameTxType:
 				isValid = true
 			}
 		}
