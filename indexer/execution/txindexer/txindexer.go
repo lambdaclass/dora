@@ -63,10 +63,16 @@ type BlockRef struct {
 	Slot        phase0.Slot
 	BlockUID    uint64
 	BlockHash   []byte        // EL block hash
+	ParentHash  []byte        // EL parent block hash, as the beacon block names it
 	BlockRoot   []byte        // Beacon block root (used as key for exec data in blockdb)
 	Block       *beacon.Block // optional, may be nil for historical blocks
 	ProcessTime time.Time     // earliest time this block can be processed (zero means immediate)
 	IsRecent    bool
+
+	// payloadDeferred is set once a recent block whose execution payload the
+	// EL did not know yet has been re-queued a slot later, so it is concluded
+	// on the second look instead of being deferred again.
+	payloadDeferred bool
 
 	// onCompletion is called after this block has been processed.
 	// Used by epoch sync batches to persist sync state once all blocks
@@ -342,12 +348,13 @@ func (t *TxIndexer) enqueueBeaconBlock(block *beacon.Block, highPriority bool) {
 	}
 
 	ref := &BlockRef{
-		Slot:      block.Slot,
-		BlockUID:  block.BlockUID,
-		BlockHash: blockIndex.ExecutionHash[:],
-		BlockRoot: block.Root[:],
-		Block:     block,
-		IsRecent:  highPriority,
+		Slot:       block.Slot,
+		BlockUID:   block.BlockUID,
+		BlockHash:  blockIndex.ExecutionHash[:],
+		ParentHash: blockIndex.ExecutionParentHash[:],
+		BlockRoot:  block.Root[:],
+		Block:      block,
+		IsRecent:   highPriority,
 	}
 
 	// For high priority blocks (from subscription), delay processing by one slot + 2 seconds
@@ -533,11 +540,12 @@ func (t *TxIndexer) createBlockRefFromSlot(slot *dbtypes.AssignedSlot) *BlockRef
 	}
 
 	ref := &BlockRef{
-		Slot:      phase0.Slot(slot.Block.Slot),
-		BlockUID:  slot.Block.BlockUid,
-		BlockHash: slot.Block.EthBlockHash,
-		BlockRoot: slot.Block.Root,
-		Block:     t.indexerCtx.BeaconIndexer.GetBlockByRoot(phase0.Root(slot.Block.Root)),
+		Slot:       phase0.Slot(slot.Block.Slot),
+		BlockUID:   slot.Block.BlockUid,
+		BlockHash:  slot.Block.EthBlockHash,
+		ParentHash: slot.Block.EthBlockParentHash,
+		BlockRoot:  slot.Block.Root,
+		Block:      t.indexerCtx.BeaconIndexer.GetBlockByRoot(phase0.Root(slot.Block.Root)),
 	}
 
 	return ref

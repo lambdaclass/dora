@@ -3,9 +3,11 @@ package txindexer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"sort"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -57,6 +59,32 @@ func (t *TxIndexer) fetchBlockData(ctx context.Context, ref *BlockRef) (*blockDa
 		// Fetch transactions if not already available from beacon block
 		if transactions == nil {
 			txs, bn, bh, coinbase, wdt, err := t.fetchBlockTransactions(ctx, rpcClient, ref.BlockHash)
+			if errors.Is(err, errBlockNotFound) {
+				// From Gloas on, the beacon block carries only a bid: the payload is
+				// revealed separately, and a slot whose payload never got revealed
+				// has no execution block behind the hash the bid names. A client
+				// that knows the bid's parent but not the bid's hash is past this
+				// slot without having executed anything for it, so the slot has no
+				// execution data. It is not a fetch failure, and treating it as one
+				// stalled the indexer on every such slot.
+				if parentKnown, perr := t.executionBlockKnown(ctx, rpcClient, ref.ParentHash); perr == nil && parentKnown {
+					if ref.IsRecent && !ref.payloadDeferred {
+						// A payload revealed late in the slot may still be being
+						// executed; look once more a slot later before concluding.
+						t.deferBlockRef(ref)
+						return nil, client, nil
+					}
+
+					t.logger.WithFields(logrus.Fields{
+						"slot":      ref.Slot,
+						"blockHash": fmt.Sprintf("%x", ref.BlockHash),
+						"client":    client.GetName(),
+					}).Debug("no execution payload for slot: the bid's block was never executed")
+
+					return nil, client, nil
+				}
+			}
+
 			if err != nil {
 				lastErr = fmt.Errorf("fetch transactions from %s: %w", client.GetName(), err)
 				t.logger.WithError(err).WithFields(logrus.Fields{
@@ -143,7 +171,16 @@ func (t *TxIndexer) getClientsForBlock(ref *BlockRef) []*execution.Client {
 	}
 
 	// Fall back to finalized clients
-	return t.indexerCtx.GetFinalizedClients(execution.AnyClient)
+	if clients := t.indexerCtx.GetFinalizedClients(execution.AnyClient); len(clients) > 0 {
+		return clients
+	}
+
+	// Both selections above match an EL client to a beacon block through the
+	// execution hash the beacon block names. From Gloas on that hash is the
+	// bid's, and a bid whose payload was never revealed matches no EL head, so a
+	// chain with unrevealed payloads can leave every client unmatched while all
+	// of them are healthy. Any ready client can answer for a finalized block.
+	return t.indexerCtx.ExecutionPool.GetReadyEndpoints(execution.AnyClient)
 }
 
 // extractTransactionsFromBeaconBlock extracts transactions from a beacon block's execution payload.
@@ -156,7 +193,25 @@ func (t *TxIndexer) extractTransactionsFromBeaconBlock(block *beacon.Block) ([]*
 
 	payload := beaconBlock.Message.Body.ExecutionPayload
 	if payload == nil {
-		return nil, 0, common.Hash{}
+		// From Gloas on the payload is not in the block body; the beacon
+		// indexer keeps the revealed envelope next to the block when it has it.
+		envelope := block.GetExecutionPayload(t.ctx)
+		if envelope == nil || envelope.Message == nil || envelope.Message.Payload == nil {
+			return nil, 0, common.Hash{}
+		}
+
+		ep := envelope.Message.Payload
+		transactions := make([]*types.Transaction, 0, len(ep.Transactions))
+		for idx, txBytes := range ep.Transactions {
+			tx := &types.Transaction{}
+			if err := tx.UnmarshalBinary(txBytes); err != nil {
+				t.logger.WithError(err).Warnf("skipping transaction %d of slot %v: cannot decode, so it will not be indexed", idx, block.Slot)
+				continue
+			}
+			transactions = append(transactions, tx)
+		}
+
+		return transactions, ep.BlockNumber, common.Hash(ep.BlockHash)
 	}
 
 	transactions := make([]*types.Transaction, 0, len(payload.Transactions))
@@ -199,7 +254,7 @@ func (t *TxIndexer) fetchBlockTransactions(
 
 	// Check if block exists
 	if len(raw) == 0 || string(raw) == "null" {
-		return nil, 0, common.Hash{}, common.Address{}, nil, fmt.Errorf("block not found")
+		return nil, 0, common.Hash{}, common.Address{}, nil, errBlockNotFound
 	}
 
 	// Parse header fields and transactions in a single pass to avoid
@@ -290,6 +345,47 @@ func (t *TxIndexer) fetchBlockReceipts(
 	return receipts, nil
 }
 
+// errBlockNotFound is returned when the EL client answers eth_getBlockByHash
+// with null: it has no block behind that hash.
+var errBlockNotFound = errors.New("block not found")
+
+// executionBlockKnown reports whether the EL client has a block behind hash.
+// An empty or zero hash (the parent of the first execution block) is reported
+// as unknown, so callers keep the conservative path for it.
+func (t *TxIndexer) executionBlockKnown(ctx context.Context, rpcClient *exerpc.ExecutionClient, hash []byte) (bool, error) {
+	if len(hash) == 0 || common.BytesToHash(hash) == (common.Hash{}) {
+		return false, nil
+	}
+
+	ethClient := rpcClient.GetEthClient()
+	if ethClient == nil {
+		return false, fmt.Errorf("ethclient not available")
+	}
+
+	var raw json.RawMessage
+	if err := ethClient.Client().CallContext(ctx, &raw, "eth_getBlockByHash", common.BytesToHash(hash), false); err != nil {
+		return false, fmt.Errorf("eth_getBlockByHash failed: %w", err)
+	}
+
+	return len(raw) > 0 && string(raw) != "null", nil
+}
+
+// deferBlockRef re-queues a recent block one slot later, once, for the case
+// where the EL client knows the block's parent but not the block itself: the
+// payload may have been revealed late in the slot and still be executing.
+func (t *TxIndexer) deferBlockRef(ref *BlockRef) {
+	specs := t.indexerCtx.ChainState.GetSpecs()
+	ref.payloadDeferred = true
+	ref.ProcessTime = time.Now().Add(time.Duration(specs.SlotDurationMs) * time.Millisecond)
+
+	t.logger.WithFields(logrus.Fields{
+		"slot":      ref.Slot,
+		"blockHash": fmt.Sprintf("%x", ref.BlockHash),
+	}).Debug("execution payload not executed yet, looking again next slot")
+
+	t.enqueueBlockRef(ref, true)
+}
+
 // extractBeaconBlockData extracts fee recipient and withdrawals from beacon block.
 func (t *TxIndexer) extractBeaconBlockData(block *beacon.Block) (common.Address, []WithdrawalData) {
 	if block == nil {
@@ -311,6 +407,22 @@ func (t *TxIndexer) extractBeaconBlockData(block *beacon.Block) (common.Address,
 		if len(payload.Withdrawals) > 0 {
 			withdrawals = make([]WithdrawalData, 0, len(payload.Withdrawals))
 			for _, w := range payload.Withdrawals {
+				withdrawals = append(withdrawals, WithdrawalData{
+					Index:     uint64(w.Index),
+					Validator: uint64(w.ValidatorIndex),
+					Address:   common.Address(w.Address),
+					Amount:    uint64(w.Amount), // Already in Gwei
+				})
+			}
+		}
+	} else if envelope := block.GetExecutionPayload(t.ctx); envelope != nil && envelope.Message != nil && envelope.Message.Payload != nil {
+		// Gloas: the payload lives in the revealed envelope, not in the body.
+		ep := envelope.Message.Payload
+		feeRecipient = common.Address(ep.FeeRecipient)
+
+		if len(ep.Withdrawals) > 0 {
+			withdrawals = make([]WithdrawalData, 0, len(ep.Withdrawals))
+			for _, w := range ep.Withdrawals {
 				withdrawals = append(withdrawals, WithdrawalData{
 					Index:     uint64(w.Index),
 					Validator: uint64(w.ValidatorIndex),
